@@ -507,6 +507,12 @@ bool ClientData::detach_condition_and_queue_is_empty()
 }
 
 ///=============================================================================
+SessionReadLock ClientData::lock_session() const
+{
+  return static_cast<rmw_context_impl_t *>(rmw_node_->context->impl)->lock_session_shared();
+}
+
+///=============================================================================
 rmw_ret_t ClientData::shutdown()
 {
   bool expected = false;

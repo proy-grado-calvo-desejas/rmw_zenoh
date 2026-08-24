@@ -178,6 +178,7 @@ rmw_create_node(
     RCUTILS_SET_ERROR_MSG("context has been shutdown");
     return nullptr;
   }
+  const auto session_lock = context_impl->lock_session_shared();
 
   int validation_result = RMW_NODE_NAME_VALID;
   rmw_ret_t ret = rmw_validate_node_name(name, &validation_result, nullptr);
@@ -278,7 +279,10 @@ rmw_destroy_node(rmw_node_t * node)
     return RMW_RET_ERROR;
   }
 
-  context_impl->delete_node_data(node);
+  {
+    const auto session_lock = context_impl->lock_session_shared();
+    context_impl->delete_node_data(node);
+  }
 
   allocator->deallocate(const_cast<char *>(node->namespace_), allocator->state);
   allocator->deallocate(const_cast<char *>(node->name), allocator->state);
@@ -400,6 +404,7 @@ rmw_create_publisher(
     RMW_SET_ERROR_MSG("context_impl is shutdown");
     return nullptr;
   }
+  const auto session_lock = context_impl->lock_session_shared();
   if (!context_impl->session_is_valid()) {
     RMW_SET_ERROR_MSG("zenoh session is invalid");
     return nullptr;
@@ -493,6 +498,7 @@ rmw_destroy_publisher(rmw_node_t * node, rmw_publisher_t * publisher)
     publisher->implementation_identifier,
     rmw_zenoh_cpp::rmw_zenoh_identifier,
     return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
+  const auto session_lock = context_impl->lock_session_shared();
   auto node_data = context_impl->get_node_data(node);
   if (node_data == nullptr) {
     return RMW_RET_INVALID_ARGUMENT;
@@ -609,6 +615,7 @@ rmw_publish(
   RMW_CHECK_FOR_NULL_WITH_MSG(
     context_impl, "context_impl is null",
     return RMW_RET_INVALID_ARGUMENT);
+  const auto session_lock = context_impl->lock_session_shared();
   auto node_data = context_impl->get_node_data(rmw_node);
   if (node_data == nullptr) {
     return RMW_RET_INVALID_ARGUMENT;
@@ -688,6 +695,7 @@ rmw_publisher_get_actual_qos(
   rmw_context_impl_s * context_impl =
     static_cast<rmw_context_impl_s *>(node->context->impl);
   RMW_CHECK_ARGUMENT_FOR_NULL(context_impl, RMW_RET_INVALID_ARGUMENT);
+  const auto session_lock = context_impl->lock_session_shared();
   auto node_data = context_impl->get_node_data(node);
   RMW_CHECK_ARGUMENT_FOR_NULL(node_data, RMW_RET_INVALID_ARGUMENT);
   auto pub_data = node_data->get_pub_data(publisher);
@@ -721,6 +729,7 @@ rmw_publish_serialized_message(
   rmw_context_impl_s * context_impl =
     static_cast<rmw_context_impl_s *>(node->context->impl);
   RMW_CHECK_ARGUMENT_FOR_NULL(context_impl, RMW_RET_INVALID_ARGUMENT);
+  const auto session_lock = context_impl->lock_session_shared();
   auto node_data = context_impl->get_node_data(node);
   RMW_CHECK_ARGUMENT_FOR_NULL(node_data, RMW_RET_INVALID_ARGUMENT);
   auto publisher_data = node_data->get_pub_data(publisher);
@@ -763,6 +772,7 @@ rmw_publisher_assert_liveliness(const rmw_publisher_t * publisher)
   rmw_context_impl_s * context_impl =
     static_cast<rmw_context_impl_s *>(node->context->impl);
   RMW_CHECK_ARGUMENT_FOR_NULL(context_impl, RMW_RET_INVALID_ARGUMENT);
+  const auto session_lock = context_impl->lock_session_shared();
   auto node_data = context_impl->get_node_data(node);
   RMW_CHECK_ARGUMENT_FOR_NULL(node_data, RMW_RET_INVALID_ARGUMENT);
   auto pub_data = node_data->get_pub_data(publisher);
@@ -949,6 +959,7 @@ rmw_create_subscription(
     RMW_SET_ERROR_MSG("context_impl is shutdown");
     return nullptr;
   }
+  const auto session_lock = context_impl->lock_session_shared();
   if (!context_impl->session_is_valid()) {
     RMW_SET_ERROR_MSG("zenoh session is invalid");
     return nullptr;
@@ -1045,6 +1056,7 @@ rmw_destroy_subscription(rmw_node_t * node, rmw_subscription_t * subscription)
     subscription->implementation_identifier,
     rmw_zenoh_cpp::rmw_zenoh_identifier,
     return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
+  const auto session_lock = context_impl->lock_session_shared();
   auto node_data = context_impl->get_node_data(node);
   if (node_data == nullptr) {
     return RMW_RET_INVALID_ARGUMENT;
@@ -1106,6 +1118,7 @@ rmw_subscription_get_actual_qos(
   rmw_zenoh_cpp::SubscriptionData * sub_data =
     static_cast<rmw_zenoh_cpp::SubscriptionData *>(subscription->data);
   RMW_CHECK_ARGUMENT_FOR_NULL(sub_data, RMW_RET_INVALID_ARGUMENT);
+  const auto session_lock = sub_data->lock_session();
 
   *qos = sub_data->topic_info().qos_;
   return RMW_RET_OK;
@@ -1164,6 +1177,7 @@ rmw_take(
   rmw_zenoh_cpp::SubscriptionData * sub_data =
     static_cast<rmw_zenoh_cpp::SubscriptionData *>(subscription->data);
   RMW_CHECK_ARGUMENT_FOR_NULL(sub_data, RMW_RET_INVALID_ARGUMENT);
+  const auto session_lock = sub_data->lock_session();
 
   if (!TRACETOOLS_TRACEPOINT_ENABLED(rmw_take)) {
     return sub_data->take_one_message(ros_message, nullptr, taken);
@@ -1204,6 +1218,7 @@ rmw_take_with_info(
   rmw_zenoh_cpp::SubscriptionData * sub_data =
     static_cast<rmw_zenoh_cpp::SubscriptionData *>(subscription->data);
   RMW_CHECK_ARGUMENT_FOR_NULL(sub_data, RMW_RET_INVALID_ARGUMENT);
+  const auto session_lock = sub_data->lock_session();
 
   rmw_ret_t ret = sub_data->take_one_message(ros_message, message_info, taken);
   TRACETOOLS_TRACEPOINT(
@@ -1241,6 +1256,7 @@ rmw_take_sequence(
   rmw_zenoh_cpp::SubscriptionData * sub_data =
     static_cast<rmw_zenoh_cpp::SubscriptionData *>(subscription->data);
   RMW_CHECK_ARGUMENT_FOR_NULL(sub_data, RMW_RET_INVALID_ARGUMENT);
+  const auto session_lock = sub_data->lock_session();
 
   if (0u == count) {
     RMW_SET_ERROR_MSG("count cannot be 0");
@@ -1316,6 +1332,7 @@ __rmw_take_serialized(
   rmw_zenoh_cpp::SubscriptionData * sub_data =
     static_cast<rmw_zenoh_cpp::SubscriptionData *>(subscription->data);
   RMW_CHECK_ARGUMENT_FOR_NULL(sub_data, RMW_RET_INVALID_ARGUMENT);
+  const auto session_lock = sub_data->lock_session();
 
   rmw_ret_t ret = sub_data->take_serialized_message(
     serialized_message,
@@ -1458,6 +1475,7 @@ rmw_create_client(
     RMW_SET_ERROR_MSG("context_impl is shutdown");
     return nullptr;
   }
+  const auto session_lock = context_impl->lock_session_shared();
   if (!context_impl->session_is_valid()) {
     RMW_SET_ERROR_MSG("zenoh session is invalid");
     return nullptr;
@@ -1556,6 +1574,7 @@ rmw_destroy_client(rmw_node_t * node, rmw_client_t * client)
     client->implementation_identifier,
     rmw_zenoh_cpp::rmw_zenoh_identifier,
     return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
+  const auto session_lock = context_impl->lock_session_shared();
   auto node_data = context_impl->get_node_data(node);
   if (node_data == nullptr) {
     return RMW_RET_INVALID_ARGUMENT;
@@ -1597,6 +1616,7 @@ rmw_send_request(
   RMW_CHECK_ARGUMENT_FOR_NULL(ros_request, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(sequence_id, RMW_RET_INVALID_ARGUMENT);
 
+  const auto session_lock = client_data->lock_session();
   return client_data->send_request(ros_request, sequence_id);
 }
 
@@ -1627,6 +1647,7 @@ rmw_take_response(
   RMW_CHECK_ARGUMENT_FOR_NULL(ros_response, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(request_header, RMW_RET_INVALID_ARGUMENT);
 
+  const auto session_lock = client_data->lock_session();
   rmw_ret_t ret = client_data->take_response(request_header, ros_response, taken);
   TRACETOOLS_TRACEPOINT(
     rmw_take_response,
@@ -1656,6 +1677,7 @@ rmw_client_request_publisher_get_actual_qos(
     static_cast<rmw_zenoh_cpp::ClientData *>(client->data);
   RMW_CHECK_ARGUMENT_FOR_NULL(client_data, RMW_RET_INVALID_ARGUMENT);
 
+  const auto session_lock = client_data->lock_session();
   *qos = client_data->topic_info().qos_;
   return RMW_RET_OK;
 }
@@ -1723,6 +1745,7 @@ rmw_create_service(
     RMW_SET_ERROR_MSG("context_impl is shutdown");
     return nullptr;
   }
+  const auto session_lock = context_impl->lock_session_shared();
   if (!context_impl->session_is_valid()) {
     RMW_SET_ERROR_MSG("zenoh session is invalid");
     return nullptr;
@@ -1816,6 +1839,7 @@ rmw_destroy_service(rmw_node_t * node, rmw_service_t * service)
     service->implementation_identifier,
     rmw_zenoh_cpp::rmw_zenoh_identifier,
     return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
+  const auto session_lock = context_impl->lock_session_shared();
   auto node_data = context_impl->get_node_data(node);
   if (node_data == nullptr) {
     return RMW_RET_INVALID_ARGUMENT;
@@ -1856,6 +1880,7 @@ rmw_take_request(
   RMW_CHECK_ARGUMENT_FOR_NULL(request_header, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(ros_request, RMW_RET_INVALID_ARGUMENT);
 
+  const auto session_lock = service_data->lock_session();
   rmw_ret_t ret = service_data->take_request(
     request_header,
     ros_request,
@@ -1895,6 +1920,7 @@ rmw_send_response(
     static_cast<rmw_zenoh_cpp::ServiceData *>(service->data);
   RMW_CHECK_ARGUMENT_FOR_NULL(service_data, RMW_RET_INVALID_ARGUMENT);
 
+  const auto session_lock = service_data->lock_session();
   return service_data->send_response(
     request_header,
     ros_response);
@@ -1918,6 +1944,7 @@ rmw_service_request_subscription_get_actual_qos(
     static_cast<rmw_zenoh_cpp::ServiceData *>(service->data);
   RMW_CHECK_ARGUMENT_FOR_NULL(service_data, RMW_RET_INVALID_ARGUMENT);
 
+  const auto session_lock = service_data->lock_session();
   *qos = service_data->topic_info().qos_;
   return RMW_RET_OK;
 }
@@ -2562,6 +2589,7 @@ rmw_get_gid_for_publisher(const rmw_publisher_t * publisher, rmw_gid_t * gid)
   rmw_context_impl_s * context_impl =
     static_cast<rmw_context_impl_s *>(node->context->impl);
   RMW_CHECK_ARGUMENT_FOR_NULL(context_impl, RMW_RET_INVALID_ARGUMENT);
+  const auto session_lock = context_impl->lock_session_shared();
   auto node_data = context_impl->get_node_data(node);
   RMW_CHECK_ARGUMENT_FOR_NULL(node_data, RMW_RET_INVALID_ARGUMENT);
   auto pub_data = node_data->get_pub_data(publisher);
@@ -2589,6 +2617,7 @@ rmw_get_gid_for_client(const rmw_client_t * client, rmw_gid_t * gid)
     static_cast<rmw_zenoh_cpp::ClientData *>(client->data);
   RMW_CHECK_ARGUMENT_FOR_NULL(client_data, RMW_RET_INVALID_ARGUMENT);
 
+  const auto session_lock = client_data->lock_session();
   gid->implementation_identifier = rmw_zenoh_cpp::rmw_zenoh_identifier;
   memcpy(gid->data, client_data->copy_gid().data(), RMW_GID_STORAGE_SIZE);
 

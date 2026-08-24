@@ -38,6 +38,7 @@
 #include "graph_cache.hpp"
 #include "liveliness_utils.hpp"
 #include "message_type_support.hpp"
+#include "session_lock.hpp"
 #include "type_support_common.hpp"
 #include "zenoh_utils.hpp"
 
@@ -125,6 +126,10 @@ public:
 
   // Check if this SubscriptionData is shutdown.
   bool is_shutdown() const;
+
+  // Acquire a shared lock on the Zenoh session of the context that owns this
+  // subscription. Held by RMW entry points for the duration of a call.
+  SessionReadLock lock_session() const;
 
   // Destructor.
   ~SubscriptionData();

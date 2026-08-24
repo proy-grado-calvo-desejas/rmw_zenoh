@@ -514,6 +514,12 @@ bool ServiceData::detach_condition_and_queue_is_empty()
 }
 
 ///=============================================================================
+SessionReadLock ServiceData::lock_session() const
+{
+  return static_cast<rmw_context_impl_t *>(rmw_node_->context->impl)->lock_session_shared();
+}
+
+///=============================================================================
 rmw_ret_t ServiceData::shutdown()
 {
   rmw_ret_t ret = RMW_RET_OK;

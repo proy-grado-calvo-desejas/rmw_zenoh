@@ -32,6 +32,7 @@
 #include "liveliness_utils.hpp"
 #include "message_type_support.hpp"
 #include "service_type_support.hpp"
+#include "session_lock.hpp"
 #include "type_support_common.hpp"
 #include "zenoh_utils.hpp"
 
@@ -96,6 +97,10 @@ public:
 
   // Check if this ClientData is shutdown.
   bool is_shutdown() const;
+
+  // Acquire a shared lock on the Zenoh session of the context that owns this
+  // client. Held by RMW entry points for the duration of a call.
+  SessionReadLock lock_session() const;
 
   // Destructor.
   ~ClientData();

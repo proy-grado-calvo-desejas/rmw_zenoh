@@ -837,6 +837,12 @@ SubscriptionData::create_subscription_endpoint(
 }
 
 ///=============================================================================
+SessionReadLock SubscriptionData::lock_session() const
+{
+  return static_cast<rmw_context_impl_t *>(rmw_node_->context->impl)->lock_session_shared();
+}
+
+///=============================================================================
 rmw_ret_t SubscriptionData::shutdown()
 {
   rmw_ret_t ret = RMW_RET_OK;

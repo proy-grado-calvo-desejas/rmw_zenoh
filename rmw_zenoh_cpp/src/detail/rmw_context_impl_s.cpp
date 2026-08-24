@@ -21,6 +21,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -36,6 +37,7 @@
 #include "identifier.hpp"
 #include "logging_macros.hpp"
 #include "rmw_node_data.hpp"
+#include "session_lock.hpp"
 #include "zenoh_config.hpp"
 
 #include "rcpputils/scope_exit.hpp"
@@ -123,6 +125,11 @@ public:
     return enclave_;
   }
 
+  std::size_t domain_id() const
+  {
+    return domain_id_;
+  }
+
   const std::shared_ptr<zenoh::Session> session() const
   {
     return session_;
@@ -166,6 +173,11 @@ public:
   rmw_zenoh_cpp::BufferBackendContext * buffer_backend_context()
   {
     return buffer_backend_context_.get();
+  }
+
+  rmw_zenoh_cpp::SessionReadLock lock_session_shared() const
+  {
+    return rmw_zenoh_cpp::SessionReadLock(session_mutex_);
   }
 
   bool create_node_data(
@@ -556,6 +568,10 @@ private:
 
   // Mutex to lock when accessing members.
   mutable std::mutex mutex_;
+  // Reader/writer lock over the zenoh session. RMW operations that touch
+  // session-owned handles take it shared; a writer takes it exclusively while
+  // it swaps the session out from under them.
+  mutable std::shared_mutex session_mutex_;
   // The ROS domain id of this context.
   std::size_t domain_id_;
   // Enclave, name used to find security artifacts in a sros2 keystore.
@@ -618,6 +634,12 @@ std::string rmw_context_impl_s::enclave() const
 }
 
 ///=============================================================================
+std::size_t rmw_context_impl_s::domain_id() const
+{
+  return data_->domain_id();
+}
+
+///=============================================================================
 const std::shared_ptr<zenoh::Session> rmw_context_impl_s::session() const
 {
   return data_->session();
@@ -675,6 +697,12 @@ std::shared_ptr<rmw_zenoh_cpp::BufferPool> rmw_context_impl_s::serialization_buf
 rmw_zenoh_cpp::BufferBackendContext * rmw_context_impl_s::buffer_backend_context()
 {
   return data_->buffer_backend_context();
+}
+
+///=============================================================================
+rmw_zenoh_cpp::SessionReadLock rmw_context_impl_s::lock_session_shared() const
+{
+  return data_->lock_session_shared();
 }
 
 ///=============================================================================

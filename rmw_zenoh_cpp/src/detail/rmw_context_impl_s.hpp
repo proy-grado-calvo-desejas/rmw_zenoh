@@ -25,6 +25,7 @@
 #include "buffer_backend_context.hpp"
 #include "graph_cache.hpp"
 #include "rmw_node_data.hpp"
+#include "session_lock.hpp"
 #include "zenoh_utils.hpp"
 
 #include "rmw/ret_types.h"
@@ -48,6 +49,9 @@ public:
 
   // Get a copy of the enclave.
   std::string enclave() const;
+
+  // Get the ROS domain id of this context.
+  std::size_t domain_id() const;
 
   // Loan the Zenoh session.
   const std::shared_ptr<zenoh::Session> session() const;
@@ -93,6 +97,13 @@ public:
 
   /// Return a pointer to the per-context BufferBackendContext.
   rmw_zenoh_cpp::BufferBackendContext * buffer_backend_context();
+
+  /// Acquire a shared (reader) lock on the Zenoh session.
+  /// Every RMW entry point that reaches a session-owned Zenoh handle holds one
+  /// of these for the duration of the call, so that a writer -- which takes the
+  /// matching exclusive lock -- cannot swap the session mid-call.
+  [[nodiscard]]
+  rmw_zenoh_cpp::SessionReadLock lock_session_shared() const;
 
   // Forward declaration
   class Data;

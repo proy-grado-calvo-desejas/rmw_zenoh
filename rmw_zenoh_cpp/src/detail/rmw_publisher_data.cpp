@@ -985,6 +985,12 @@ PublisherData::~PublisherData()
 }
 
 ///=============================================================================
+SessionReadLock PublisherData::lock_session() const
+{
+  return static_cast<rmw_context_impl_t *>(rmw_node_->context->impl)->lock_session_shared();
+}
+
+///=============================================================================
 rmw_ret_t PublisherData::shutdown()
 {
   std::unordered_map<std::string, std::shared_ptr<PublisherEndpoint>> endpoints_to_destroy;
