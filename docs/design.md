@@ -315,6 +315,79 @@ The user can use a custom configuration by setting the `ZENOH_SESSION_CONFIG_URI
 * Session::liveliness_get
 * Session::close
 
+## Dynamic session reconfiguration
+
+The Zenoh session behind a context can be rebuilt at runtime from a new configuration, without the application restarting or losing any of its handles.
+This is meant for a Zenoh router plugin (or any other operator tooling) that needs to re-point a running ROS 2 process at different endpoints, change its scouting, or turn transports on and off.
+
+### Control channel
+
+Each context subscribes to a key in a hermetic admin namespace:
+
+```
+@ros2_admin/<domain_id>/session/<session_id>/config
+```
+
+The `@ros2_admin/` prefix mirrors the `@ros2_lv/` namespace used by liveliness tokens.
+Zenoh's wildcard matching never crosses between the two, nor between either of them and regular ROS topics, so admin messages can never be delivered to a ROS subscription and vice versa.
+A publisher can target a single session by its id, or every session in a domain at once:
+
+```
+@ros2_admin/0/session/**/config
+```
+
+The payload is the raw json5 configuration, in the same format as [`DEFAULT_RMW_ZENOH_SESSION_CONFIG.json5`](../rmw_zenoh_cpp/config/DEFAULT_RMW_ZENOH_SESSION_CONFIG.json5).
+
+Two sibling keys complete the channel:
+
+* `@ros2_admin/<domain_id>/session/<session_id>/current_config` — a queryable that replies with `{"session_id": ..., "last_reconfigure_time_ns": ..., "config": ...}`, so the plugin can read back what is actually loaded instead of trusting its own send history.
+* `@ros2_admin/<domain_id>/session/<session_id>/ack` — the outcome of each reconfiguration attempt, as `{"session_id": ..., "success": ..., "error": ...}`. The session id in both the ack key and its payload is the one in force *after* the attempt.
+
+### Flow
+
+1. The admin subscriber fires on a Zenoh thread owned by the session that is about to be destroyed, so it does nothing but queue the payload and return.
+2. A reconfiguration worker thread owned by the context pops the queue and validates the payload as a Zenoh configuration. A malformed configuration is rejected here, before anything is torn down.
+3. The worker takes the exclusive session lock, which blocks every RMW operation that touches the session.
+4. Every node's publishers, subscriptions, services and clients undeclare their Zenoh handles and liveliness tokens while the old session is still alive, so remote peers see them go away cleanly. The recreation parameters are already held as members on each entity, so nothing has to be snapshotted.
+5. The admin channel and the graph liveliness subscriber are undeclared and the session is closed.
+6. A new session is opened from the new configuration.
+7. The graph cache is reset onto the new session id and re-primed with a liveliness query.
+8. Every entity is re-declared on the new session, and the admin channel comes back up so the process can be reconfigured again.
+9. The worker publishes an ack and releases the lock.
+
+The `rmw_node_t *`, `rmw_publisher_t *`, `rmw_subscription_t *`, `rmw_service_t *` and `rmw_client_t *` pointers the application holds all stay valid throughout: the objects behind them are mutated in place rather than destroyed. Wait sets keep working for the same reason.
+
+### Observable behavior
+
+* **Identity churn.** Entity GIDs and liveliness tokens are derived from the Zenoh session id (see [Graph Cache](#graph-cache)), so every entity of the process gets a new GID. Remote peers see the entities disappear and reappear, and `MATCHED`/`UNMATCHED` events fire on both sides. The graph cache emits the unmatched half of that before it resets, so local match counts stay balanced.
+* **Data loss.** Nothing flows between teardown and re-declaration. Queued messages are dropped, service requests that have arrived but not been answered are abandoned, and pending client replies are discarded. Reconfiguration is a brief network blip, not a seamless handover.
+* **Latency.** In-flight RMW calls block until the reconfiguration finishes and then run against the new session.
+* **Failure.** If the new session cannot be opened, the previous configuration is restored. If that also fails, the context is left without a session and RMW calls fail until a working configuration arrives.
+* **Router check.** The wait for a Zenoh router is bounded during a reconfiguration (unlike at startup, where it can block indefinitely), so a configuration pointing at an unreachable router costs seconds rather than freezing the process.
+
+### Authorization
+
+Anything that can publish to `@ros2_admin/<domain_id>/session/**/config` can reconfigure any session in that domain.
+Deployments that need this restricted should apply Zenoh-level ACLs to the `@ros2_admin/**` key space.
+
+### Related RMW APIs
+
+* rmw_context_impl_s::reconfigure
+* rmw_context_impl_s::lock_session_shared
+* rmw_context_impl_s::session_config
+* rmw_zenoh_cpp::AdminChannel
+* NodeData::detach_from_session / NodeData::rebind
+* GraphCache::reset / GraphCache::remap_entity_gid_hash
+
+### Related Zenoh APIs
+
+* Config::from_str
+* Config::to_string
+* Session::declare_subscriber
+* Session::declare_queryable
+* Session::put
+* Session::close
+
 ## Namespaces
 
 ROS 2 has a concept of "namespaces", where everything under that namespace has an additional prefix added to all names.
