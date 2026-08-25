@@ -2778,3 +2778,51 @@ rmw_zenoh_get_session(const rmw_context_t * context)
     context->impl);
   return context_impl->session();
 }
+
+//==============================================================================
+/// Get the json5 configuration the context's Zenoh session was built from.
+std::string
+rmw_zenoh_get_session_config(const rmw_context_t * context)
+{
+  RMW_CHECK_ARGUMENT_FOR_NULL(context, std::string());
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    context,
+    context->implementation_identifier,
+    rmw_zenoh_cpp::rmw_zenoh_identifier,
+    return std::string());
+  RMW_CHECK_FOR_NULL_WITH_MSG(
+    context->impl,
+    "expected initialized context",
+    return std::string());
+  rmw_context_impl_s * context_impl = static_cast<rmw_context_impl_s *>(
+    context->impl);
+  return context_impl->session_config();
+}
+
+//==============================================================================
+/// Rebuild the context's Zenoh session from a new configuration.
+rmw_ret_t
+rmw_zenoh_reconfigure_session(rmw_context_t * context, const char * config_json5)
+{
+  RMW_CHECK_ARGUMENT_FOR_NULL(context, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_ARGUMENT_FOR_NULL(config_json5, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    context,
+    context->implementation_identifier,
+    rmw_zenoh_cpp::rmw_zenoh_identifier,
+    return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
+  RMW_CHECK_FOR_NULL_WITH_MSG(
+    context->impl,
+    "expected initialized context",
+    return RMW_RET_INVALID_ARGUMENT);
+  rmw_context_impl_s * context_impl = static_cast<rmw_context_impl_s *>(
+    context->impl);
+
+  std::string error;
+  const rmw_ret_t ret = context_impl->reconfigure(config_json5, error);
+  if (ret != RMW_RET_OK) {
+    RMW_SET_ERROR_MSG_WITH_FORMAT_STRING(
+      "unable to reconfigure the zenoh session: %s", error.c_str());
+  }
+  return ret;
+}

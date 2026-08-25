@@ -16,6 +16,7 @@
 #define DETAIL__RMW_CONTEXT_IMPL_S_HPP_
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -100,10 +101,44 @@ public:
 
   /// Acquire a shared (reader) lock on the Zenoh session.
   /// Every RMW entry point that reaches a session-owned Zenoh handle holds one
-  /// of these for the duration of the call, so that a writer -- which takes the
-  /// matching exclusive lock -- cannot swap the session mid-call.
+  /// of these for the duration of the call, so that reconfigure() -- which takes
+  /// the matching exclusive lock -- cannot swap the session mid-call.
   [[nodiscard]]
   rmw_zenoh_cpp::SessionReadLock lock_session_shared() const;
+
+  /// Return the json5 configuration the running Zenoh session was built from.
+  std::string session_config() const;
+
+  /// Return the wall-clock time in nanoseconds of the last successful
+  /// reconfiguration, or 0 if the session has never been reconfigured.
+  int64_t last_reconfigure_time() const;
+
+  /// Tear the Zenoh session down and rebuild it from `config_json5`,
+  /// re-declaring every ROS entity this context owns on the new session.
+  /**
+   * The rmw_node_t, rmw_publisher_t, rmw_subscription_t, rmw_service_t and
+   * rmw_client_t pointers the application holds all stay valid: the objects
+   * behind them are mutated in place rather than destroyed.
+   *
+   * The zenoh-level identity of every entity changes, because it is derived
+   * from the session id. Remote peers therefore see every entity of this
+   * process disappear and reappear, and matched/unmatched events fire
+   * accordingly. Messages published or received during the window between
+   * teardown and re-declaration are lost, and queued messages, unanswered
+   * service requests and pending client replies are dropped.
+   *
+   * If the new session cannot be opened, the previous configuration is
+   * restored. If that also fails, the context is left without a session and
+   * subsequent RMW calls fail until a working configuration arrives.
+   *
+   * This call blocks until every in-flight RMW operation has finished.
+   *
+   * @param config_json5 The new zenoh configuration, in the same json5 format
+   *   as config/DEFAULT_RMW_ZENOH_SESSION_CONFIG.json5.
+   * @param error Set to a human readable reason when the return value is not
+   *   RMW_RET_OK.
+   */
+  rmw_ret_t reconfigure(const std::string & config_json5, std::string & error);
 
   // Forward declaration
   class Data;
