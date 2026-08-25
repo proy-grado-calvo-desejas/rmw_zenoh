@@ -91,6 +91,19 @@ public:
   // Check if this ServiceData is shutdown.
   bool is_shutdown() const;
 
+  // Undeclare the queryable and the liveliness token without destroying the
+  // ServiceData itself, so that the rmw_service_t handed to the application
+  // stays valid. Requests that have arrived but not yet been taken, and
+  // responses that have not yet been sent, are dropped: the zenoh::Query
+  // objects they hold belong to the session that is about to go away, so the
+  // clients waiting on them will time out.
+  void detach_from_session();
+
+  // Re-declare the queryable and the liveliness token on `session`.
+  // The liveliness Entity is rebuilt so that it advertises the id of the new
+  // session, which also changes the zenoh-level gid of this service.
+  bool rebind(const std::shared_ptr<zenoh::Session> & session);
+
   // Acquire a shared lock on the Zenoh session of the context that owns this
   // service. Held by RMW entry points for the duration of a call.
   SessionReadLock lock_session() const;
@@ -104,7 +117,6 @@ private:
     const rmw_node_t * rmw_node,
     const rmw_service_t * rmw_service,
     std::shared_ptr<liveliness::Entity> entity,
-    std::shared_ptr<zenoh::Session> session,
     zenoh::KeyExpr keyexpr,
     const void * request_type_support_impl,
     const void * response_type_support_impl,
@@ -113,6 +125,10 @@ private:
 
   // Shutdown this ServiceData.
   rmw_ret_t shutdown();
+
+  // Declare the queryable and the liveliness token on `session`.
+  // Used by both make() and rebind().
+  bool declare_on_session(const std::shared_ptr<zenoh::Session> & session);
 
   // Internal mutex.
   mutable std::mutex mutex_;

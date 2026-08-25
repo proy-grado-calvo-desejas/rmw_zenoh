@@ -21,6 +21,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -1472,6 +1473,79 @@ void GraphCache::unregister_discovery_callbacks(std::size_t gid_hash)
   // Remove from all topics in publisher discovery callbacks
   for (auto & [topic_name, callbacks] : publisher_discovery_callbacks_) {
     callbacks.erase(gid_hash);
+  }
+}
+
+///=============================================================================
+void GraphCache::reset(const zenoh::Id & new_zid)
+{
+  // Collect the liveliness keyexpr of every pub/sub/service/client currently in
+  // the graph. They are removed through parse_del() rather than by clearing the
+  // maps so that local entities still receive the UNMATCHED events that pair up
+  // with the MATCHED events they were given when the graph was populated.
+  std::vector<std::string> keyexprs;
+  {
+    std::lock_guard<std::mutex> lock(graph_mutex_);
+    const auto collect = [&keyexprs](const GraphNode::TopicMap & topic_map) {
+        for (const auto & [topic_name, topic_type_map] : topic_map) {
+          for (const auto & [topic_type, topic_qos_map] : topic_type_map) {
+            for (const auto & [qos, topic_data] : topic_qos_map) {
+              for (const auto & entity : topic_data->pubs_) {
+                keyexprs.push_back(entity->liveliness_keyexpr());
+              }
+              for (const auto & entity : topic_data->subs_) {
+                keyexprs.push_back(entity->liveliness_keyexpr());
+              }
+            }
+          }
+        }
+      };
+    collect(graph_topics_);
+    collect(graph_services_);
+  }
+
+  for (const std::string & keyexpr : keyexprs) {
+    parse_del(keyexpr);
+  }
+
+  // Whatever is left (node entries, and anything that arrived while the
+  // deletions above were running) is dropped outright.
+  std::lock_guard<std::mutex> lock(graph_mutex_);
+  graph_.clear();
+  graph_topics_.clear();
+  graph_services_.clear();
+  total_nodes_in_graph_ = 0;
+  zid_str_ = new_zid.to_string();
+
+  RMW_ZENOH_LOG_DEBUG_NAMED(
+    "rmw_zenoh_cpp",
+    "[GraphCache] Reset graph cache to zenoh session %s.", zid_str_.c_str());
+}
+
+///=============================================================================
+void GraphCache::remap_entity_gid_hash(std::size_t old_gid_hash, std::size_t new_gid_hash)
+{
+  if (old_gid_hash == new_gid_hash) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(events_mutex_);
+
+  // Extract before inserting: inserting into an unordered_map may rehash, which
+  // would invalidate an iterator held across the insertion.
+  const auto callbacks_it = event_callbacks_.find(old_gid_hash);
+  if (callbacks_it != event_callbacks_.end()) {
+    GraphEventCallbacks callbacks = std::move(callbacks_it->second);
+    event_callbacks_.erase(callbacks_it);
+    event_callbacks_[new_gid_hash] = std::move(callbacks);
+  }
+
+  const auto changes_it = unregistered_event_changes_.find(old_gid_hash);
+  if (changes_it != unregistered_event_changes_.end()) {
+    std::unordered_map<rmw_zenoh_event_type_t, int32_t> changes =
+      std::move(changes_it->second);
+    unregistered_event_changes_.erase(changes_it);
+    unregistered_event_changes_[new_gid_hash] = std::move(changes);
   }
 }
 

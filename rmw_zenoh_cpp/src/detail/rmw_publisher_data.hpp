@@ -45,7 +45,7 @@
 namespace rmw_zenoh_cpp
 {
 ///=============================================================================
-class PublisherData final
+class PublisherData final : public std::enable_shared_from_this<PublisherData>
 {
 public:
   // Make a shared_ptr of PublisherData.
@@ -93,6 +93,18 @@ public:
   // Check if this PublisherData is shutdown.
   bool is_shutdown() const;
 
+  // Undeclare every Zenoh handle held by this publisher without destroying the
+  // PublisherData itself, so that the rmw_publisher_t handed to the application
+  // stays valid. Called by the reconfiguration worker while the current
+  // zenoh::Session is still alive; rebind() puts the publisher back on a new
+  // session afterwards.
+  void detach_from_session();
+
+  // Re-declare every Zenoh handle on `session`.
+  // The liveliness Entity is rebuilt so that it advertises the id of the new
+  // session, which also changes the zenoh-level gid of this publisher.
+  bool rebind(const std::shared_ptr<zenoh::Session> & session);
+
   // Acquire a shared lock on the Zenoh session of the context that owns this
   // publisher. Held by RMW entry points for the duration of a call.
   SessionReadLock lock_session() const;
@@ -125,12 +137,15 @@ private:
     const rmw_publisher_t * const rmw_publisher,
     const rmw_node_t * rmw_node,
     std::shared_ptr<liveliness::Entity> entity,
-    std::shared_ptr<zenoh::Session> session,
-    zenoh::LivelinessToken token,
     const void * type_support_impl,
     std::unique_ptr<MessageTypeSupport> type_support,
     bool is_buffer_aware,
     std::unordered_map<std::string, std::string> backend_metadata);
+
+  // Declare the liveliness token, the base publisher and -- for buffer-aware
+  // publishers -- the CPU-group endpoint on `session`, then (re-)register the
+  // subscriber discovery callback. Used by both make() and rebind().
+  bool declare_on_session(const std::shared_ptr<zenoh::Session> & session);
 
   // Discovery callback for Buffer-aware publishers
   void on_subscriber_discovered(const liveliness::Entity & entity);
@@ -139,10 +154,11 @@ private:
   std::shared_ptr<PublisherEndpoint> get_or_create_endpoint(
     const std::string & full_key);
 
-  // Create a Zenoh publisher endpoint (does not require mutex_).
+  // Create a Zenoh publisher endpoint on `session` (does not require mutex_).
   // buffer_aware=false builds the base publisher (with sample-miss
   // detection); buffer_aware=true builds a per-subscriber buffer-aware endpoint.
   std::shared_ptr<PublisherEndpoint> create_publisher_endpoint(
+    const std::shared_ptr<zenoh::Session> & session,
     const std::string & full_key, bool buffer_aware = true);
 
   // Buffer-aware publish helper

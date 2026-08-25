@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -118,6 +119,18 @@ public:
   // Check if this NodeData is shutdown.
   bool is_shutdown() const;
 
+  // Undeclare this node's liveliness token and every Zenoh handle held by the
+  // publishers, subscriptions, services and clients it owns, without destroying
+  // any of them. The rmw_node_t and the entity handles the application holds
+  // stay valid; rebind() puts them back on a new session afterwards.
+  void detach_from_session();
+
+  // Re-declare this node and everything it owns on `session`.
+  // Returns false if any entity could not be re-declared; the remaining
+  // entities are still attempted so that as much of the node as possible comes
+  // back up.
+  bool rebind(const std::shared_ptr<zenoh::Session> & session);
+
   // Destructor.
   ~NodeData();
 
@@ -127,7 +140,7 @@ private:
     const rmw_node_t * const node,
     std::size_t id,
     std::shared_ptr<liveliness::Entity> entity,
-    zenoh::LivelinessToken token);
+    std::optional<zenoh::LivelinessToken> token);
 
   // Shutdown this NodeData.
   rmw_ret_t shutdown();

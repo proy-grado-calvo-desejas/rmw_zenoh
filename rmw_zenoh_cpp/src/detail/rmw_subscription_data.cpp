@@ -263,7 +263,6 @@ std::shared_ptr<SubscriptionData> SubscriptionData::make(
       node,
       graph_cache,
       std::move(entity),
-      std::move(session),
       type_support->data,
       std::move(message_type_support),
       sub_options,
@@ -271,42 +270,9 @@ std::shared_ptr<SubscriptionData> SubscriptionData::make(
       my_backend_types
     });
 
-  if (use_buffer_endpoints) {
-    sub_data->local_endpoint_info_ =
-      build_endpoint_info_from_entity(*sub_data->entity_, RMW_ENDPOINT_SUBSCRIPTION);
-
-    auto * backend_ctx = context_impl->buffer_backend_context();
-    if (backend_ctx) {
-      rosidl_buffer_backend_registry::notify_endpoint_created(
-        backend_ctx->backend_instances, sub_data->local_endpoint_info_.info);
-    }
-  }
-
-  if (!sub_data->init()) {
-    // init() already set the error
+  if (!sub_data->declare_on_session(session)) {
+    // declare_on_session() already set the error
     return nullptr;
-  }
-
-  // Register discovery callback for Buffer-aware subscribers
-  if (use_buffer_endpoints && graph_cache != nullptr) {
-    std::weak_ptr<SubscriptionData> weak_sub_data = sub_data;
-    if (!is_cpu_only_backend_types(my_backend_types)) {
-      graph_cache->register_publisher_discovery_callback(
-        topic_name,
-        sub_data->gid_hash(),
-        [weak_sub_data](const liveliness::Entity & entity) {
-          if (auto sd = weak_sub_data.lock()) {
-            sd->on_publisher_discovered(entity);
-          }
-        });
-    }
-
-    // Manually add this local subscriber to the graph cache so local publishers can discover it
-    // Liveliness events from the same session don't trigger graph updates automatically
-    graph_cache->parse_put(sub_data->entity_->liveliness_keyexpr(), false);
-    RMW_ZENOH_ROSIDL_BUFFER_LOG_DEBUG_NAMED(
-      "rmw_zenoh_cpp",
-      "[Subscription] Manually added local subscriber to graph cache for discovery");
   }
 
   return sub_data;
@@ -317,7 +283,6 @@ SubscriptionData::SubscriptionData(
   const rmw_node_t * rmw_node,
   std::shared_ptr<GraphCache> graph_cache,
   std::shared_ptr<liveliness::Entity> entity,
-  std::shared_ptr<zenoh::Session> session,
   const void * type_support_impl,
   std::unique_ptr<MessageTypeSupport> type_support,
   rmw_subscription_options_t sub_options,
@@ -326,7 +291,6 @@ SubscriptionData::SubscriptionData(
 : rmw_node_(rmw_node),
   graph_cache_(std::move(graph_cache)),
   entity_(std::move(entity)),
-  sess_(std::move(session)),
   type_support_impl_(type_support_impl),
   type_support_(std::move(type_support)),
   sub_options_(std::move(sub_options)),
@@ -342,9 +306,10 @@ SubscriptionData::SubscriptionData(
 }
 
 ///=============================================================================
-// We have to use an "init" function here, rather than do this in the constructor, because we use
-// enable_shared_from_this, which is not available in constructors.
-bool SubscriptionData::init()
+// We have to use a separate function here, rather than do this in the constructor, because we use
+// enable_shared_from_this, which is not available in constructors. It is also the path that
+// rebind() takes to put the subscription back on a freshly created session.
+bool SubscriptionData::declare_on_session(const std::shared_ptr<zenoh::Session> & session)
 {
   zenoh::ZResult result;
   zenoh::KeyExpr sub_ke(entity_->topic_info()->topic_keyexpr_, true, &result);
@@ -355,7 +320,22 @@ bool SubscriptionData::init()
 
   rmw_context_impl_t * context_impl = static_cast<rmw_context_impl_t *>(rmw_node_->context->impl);
 
-  sess_ = context_impl->session();
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    sess_ = session;
+    if (is_buffer_aware_) {
+      local_endpoint_info_ =
+        build_endpoint_info_from_entity(*entity_, RMW_ENDPOINT_SUBSCRIPTION);
+    }
+  }
+
+  if (is_buffer_aware_) {
+    auto * backend_ctx = context_impl->buffer_backend_context();
+    if (backend_ctx) {
+      rosidl_buffer_backend_registry::notify_endpoint_created(
+        backend_ctx->backend_instances, local_endpoint_info_.info);
+    }
+  }
 
   using AdvancedSubscriberOptions = zenoh::ext::SessionExt::AdvancedSubscriberOptions;
   using RecoveryOptions = AdvancedSubscriberOptions::RecoveryOptions;
@@ -427,7 +407,7 @@ bool SubscriptionData::init()
             std::move(attachment_data)),
           std::string(sample.get_keyexpr().as_string_view()));
       };
-    sub_ = context_impl->session()->ext().declare_advanced_subscriber(
+    sub_ = session->ext().declare_advanced_subscriber(
       sub_ke,
       std::move(on_sample),
       zenoh::closures::none,
@@ -442,6 +422,7 @@ bool SubscriptionData::init()
   if (is_buffer_aware_) {
     if (is_cpu_only_backend_types(my_backend_types_)) {
       auto cpu_endpoint = create_subscription_endpoint(
+        session,
         make_cpu_group_key(entity_->topic_info()->topic_keyexpr_),
         std::nullopt,
         false);
@@ -461,7 +442,7 @@ bool SubscriptionData::init()
       const std::string accel_key = make_accelerated_key(
         entity_->topic_info()->topic_keyexpr_, gid_to_hex(local_gid));
       auto accel_endpoint = create_subscription_endpoint(
-        accel_key, std::nullopt, true);
+        session, accel_key, std::nullopt, true);
       if (!accel_endpoint) {
         RMW_SET_ERROR_MSG("unable to create zenoh accelerated subscription");
         return false;
@@ -472,7 +453,7 @@ bool SubscriptionData::init()
 
   // Publish to the graph that a new subscription is in town.
   std::string liveliness_keyexpr = entity_->liveliness_keyexpr();
-  token_ = context_impl->session()->liveliness_declare_token(
+  token_ = session->liveliness_declare_token(
     zenoh::KeyExpr(liveliness_keyexpr),
     zenoh::Session::LivelinessDeclarationOptions::create_default(),
     &result);
@@ -484,6 +465,30 @@ bool SubscriptionData::init()
   }
 
   initialized_ = true;
+
+  // Register the discovery callback for Buffer-aware subscribers. Registration
+  // replays the publishers already known to the graph, so a subscription that
+  // is being re-declared on a new session picks its peers back up here.
+  if (is_buffer_aware_ && graph_cache_ != nullptr) {
+    if (!is_cpu_only_backend_types(my_backend_types_)) {
+      std::weak_ptr<SubscriptionData> weak_sub_data = weak_from_this();
+      graph_cache_->register_publisher_discovery_callback(
+        entity_->topic_info()->name_,
+        entity_->gid_hash(),
+        [weak_sub_data](const liveliness::Entity & entity) {
+          if (auto sd = weak_sub_data.lock()) {
+            sd->on_publisher_discovered(entity);
+          }
+        });
+    }
+
+    // Manually add this local subscriber to the graph cache so local publishers can discover it
+    // Liveliness events from the same session don't trigger graph updates automatically
+    graph_cache_->parse_put(entity_->liveliness_keyexpr(), false);
+    RMW_ZENOH_ROSIDL_BUFFER_LOG_DEBUG_NAMED(
+      "rmw_zenoh_cpp",
+      "[Subscription] Manually added local subscriber to graph cache for discovery");
+  }
 
   if (is_buffer_aware_) {
     RMW_ZENOH_ROSIDL_BUFFER_LOG_DEBUG_NAMED(
@@ -691,7 +696,7 @@ void SubscriptionData::create_subscription_for_key(
   const std::string & key,
   std::optional<EndpointInfoStorage> publisher_info)
 {
-  auto endpoint = create_subscription_endpoint(key, publisher_info, false);
+  auto endpoint = create_subscription_endpoint(sess_, key, publisher_info, false);
   if (endpoint) {
     sub_endpoints_[key] = endpoint;
   }
@@ -700,10 +705,18 @@ void SubscriptionData::create_subscription_for_key(
 ///=============================================================================
 std::shared_ptr<SubscriptionData::SubscriptionEndpoint>
 SubscriptionData::create_subscription_endpoint(
+  const std::shared_ptr<zenoh::Session> & session,
   const std::string & key,
   std::optional<EndpointInfoStorage> publisher_info,
   bool is_accelerated)
 {
+  if (session == nullptr) {
+    RMW_ZENOH_ROSIDL_BUFFER_LOG_ERROR_NAMED(
+      "rmw_zenoh_cpp",
+      "Cannot create subscription endpoint for key '%s': no zenoh session.", key.c_str());
+    return nullptr;
+  }
+
   zenoh::ZResult result;
   zenoh::KeyExpr sub_ke(key, true, &result);
   if (result != Z_OK) {
@@ -712,8 +725,6 @@ SubscriptionData::create_subscription_endpoint(
       "Unable to create zenoh keyexpr for key: %s", key.c_str());
     return nullptr;
   }
-
-  rmw_context_impl_t * context_impl = static_cast<rmw_context_impl_t *>(rmw_node_->context->impl);
 
   using AdvancedSubscriberOptions = zenoh::ext::SessionExt::AdvancedSubscriberOptions;
   using RecoveryOptions = AdvancedSubscriberOptions::RecoveryOptions;
@@ -812,7 +823,7 @@ SubscriptionData::create_subscription_endpoint(
         std::string(sample.get_keyexpr().as_string_view()));
     };
 
-  auto sub = context_impl->session()->ext().declare_advanced_subscriber(
+  auto sub = session->ext().declare_advanced_subscriber(
     sub_ke,
     std::move(on_sample),
     zenoh::closures::none,
@@ -834,6 +845,118 @@ SubscriptionData::create_subscription_endpoint(
     key.c_str());
 
   return endpoint;
+}
+
+///=============================================================================
+void SubscriptionData::detach_from_session()
+{
+  std::unordered_map<std::string, std::shared_ptr<SubscriptionEndpoint>> endpoints_to_destroy;
+  std::optional<zenoh::ext::AdvancedSubscriber<void>> base_sub;
+  std::optional<zenoh::LivelinessToken> token;
+  bool was_buffer_aware = false;
+  std::size_t gid_hash = 0;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (is_shutdown_ || !initialized_) {
+      return;
+    }
+    initialized_ = false;
+    was_buffer_aware = is_buffer_aware_;
+    gid_hash = entity_->gid_hash();
+    endpoints_to_destroy = std::move(sub_endpoints_);
+    sub_endpoints_.clear();
+    pending_sub_endpoints_.clear();
+    discovered_publishers_.clear();
+    base_sub = std::move(sub_);
+    sub_.reset();
+    token = std::move(token_);
+    token_.reset();
+    // Anything still queued points into buffers owned by the session that is
+    // about to be destroyed, so it is dropped rather than carried over.
+    // Reconfiguration is documented as a brief network blip.
+    message_queue_.clear();
+    last_known_published_msg_.clear();
+    sess_.reset();
+  }
+
+  // The discovery callback is keyed by gid hash, which changes when the
+  // subscription is re-declared, so drop the old registration here and let
+  // declare_on_session() install a fresh one.
+  if (was_buffer_aware && graph_cache_ != nullptr) {
+    graph_cache_->unregister_discovery_callbacks(gid_hash);
+  }
+
+  zenoh::ZResult result;
+  if (token.has_value()) {
+    std::move(token.value()).undeclare(&result);
+    if (result != Z_OK) {
+      RMW_ZENOH_LOG_ERROR_NAMED(
+        "rmw_zenoh_cpp",
+        "Unable to undeclare the liveliness token for topic '%s' while detaching",
+        entity_->topic_info().value().name_.c_str());
+    }
+  }
+
+  for (auto & [key, endpoint] : endpoints_to_destroy) {
+    if (endpoint->sub.has_value()) {
+      std::move(endpoint->sub.value()).undeclare(&result);
+      if (result != Z_OK) {
+        RMW_ZENOH_LOG_ERROR_NAMED(
+          "rmw_zenoh_cpp",
+          "Unable to undeclare subscription for key '%s' while detaching", key.c_str());
+      }
+    }
+  }
+
+  if (base_sub.has_value()) {
+    std::move(base_sub.value()).undeclare(&result);
+    if (result != Z_OK) {
+      RMW_ZENOH_LOG_ERROR_NAMED(
+        "rmw_zenoh_cpp",
+        "Unable to undeclare the subscriber for topic '%s' while detaching",
+        entity_->topic_info().value().name_.c_str());
+    }
+  }
+}
+
+///=============================================================================
+bool SubscriptionData::rebind(const std::shared_ptr<zenoh::Session> & session)
+{
+  std::size_t old_gid_hash = 0;
+  std::size_t new_gid_hash = 0;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (is_shutdown_) {
+      // A subscription destroyed during the reconfiguration window stays destroyed.
+      return true;
+    }
+    old_gid_hash = entity_->gid_hash();
+    // The liveliness keyexpr -- and therefore the gid derived from it -- embeds
+    // the zenoh session id, so the entity has to be rebuilt for the new session.
+    auto entity = liveliness::Entity::make(
+      session->get_zid(),
+      entity_->nid(),
+      entity_->id(),
+      liveliness::EntityType::Subscription,
+      entity_->node_info(),
+      entity_->topic_info());
+    if (entity == nullptr) {
+      RMW_ZENOH_LOG_ERROR_NAMED(
+        "rmw_zenoh_cpp",
+        "Unable to rebuild the entity for subscription %s on the new zenoh session.",
+        entity_->topic_info().value().name_.c_str());
+      return false;
+    }
+    entity_ = std::move(entity);
+    new_gid_hash = entity_->gid_hash();
+  }
+
+  // Carry the user's event callbacks over to the new gid.
+  if (graph_cache_ != nullptr) {
+    graph_cache_->remap_entity_gid_hash(old_gid_hash, new_gid_hash);
+  }
+
+  return declare_on_session(session);
 }
 
 ///=============================================================================
@@ -874,13 +997,17 @@ rmw_ret_t SubscriptionData::shutdown()
   }
 
   zenoh::ZResult result;
-  std::move(token_).value().undeclare(&result);
-  if (result != Z_OK) {
-    RMW_ZENOH_LOG_ERROR_NAMED(
-      "rmw_zenoh_cpp",
-      "Unable to undeclare the liveliness token for topic '%s'",
-      entity_->topic_info().value().name_.c_str());
-    return RMW_RET_ERROR;
+  // token_ is empty while the subscription is detached from a session, which is
+  // the case between the teardown and re-declare halves of a reconfiguration.
+  if (token_.has_value()) {
+    std::move(token_).value().undeclare(&result);
+    if (result != Z_OK) {
+      RMW_ZENOH_LOG_ERROR_NAMED(
+        "rmw_zenoh_cpp",
+        "Unable to undeclare the liveliness token for topic '%s'",
+        entity_->topic_info().value().name_.c_str());
+      return RMW_RET_ERROR;
+    }
   }
 
   for (auto & [key, endpoint] : endpoints_to_destroy) {

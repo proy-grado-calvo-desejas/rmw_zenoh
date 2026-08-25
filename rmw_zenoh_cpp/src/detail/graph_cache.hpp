@@ -219,6 +219,25 @@ public:
   /// @param gid_hash The gid hash of the entity
   void unregister_discovery_callbacks(std::size_t gid_hash);
 
+  /// Drop the entire graph and re-key the cache to a new Zenoh session id.
+  /// @details Every entity currently in the graph is first removed through the
+  ///   regular deletion path so that the matched-event counters of local
+  ///   entities stay balanced (each entity that was reported as matched is
+  ///   reported as unmatched). The cache is then re-keyed to @p new_zid so that
+  ///   entities re-declared on the new session are recognised as local.
+  ///   Used by rmw_context_impl_s::reconfigure().
+  /// @param new_zid The id of the Zenoh session the cache is now tracking.
+  void reset(const zenoh::Id & new_zid);
+
+  /// Move every event callback registered against an entity to a new gid hash.
+  /// @details An entity's gid is derived from the id of the Zenoh session it
+  ///   was declared on, so re-declaring it on a new session changes its gid.
+  ///   The user-facing event callbacks must survive that change, so they are
+  ///   moved rather than dropped and re-registered.
+  /// @param old_gid_hash The gid hash the entity had before it was re-declared.
+  /// @param new_gid_hash The gid hash the entity has now.
+  void remap_entity_gid_hash(std::size_t old_gid_hash, std::size_t new_gid_hash);
+
   /// Returns true if the entity is a publisher or client. False otherwise.
   static bool is_entity_pub(const liveliness::Entity & entity);
 

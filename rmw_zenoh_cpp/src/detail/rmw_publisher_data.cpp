@@ -158,78 +158,112 @@ std::shared_ptr<PublisherData> PublisherData::make(
     return nullptr;
   }
 
-  zenoh::ZResult result;
-  std::string liveliness_keyexpr = entity->liveliness_keyexpr();
-  auto token = session->liveliness_declare_token(
-    zenoh::KeyExpr(liveliness_keyexpr),
-    zenoh::Session::LivelinessDeclarationOptions::create_default(),
-    &result);
-  if (result != Z_OK) {
-    RMW_ZENOH_LOG_ERROR_NAMED(
-      "rmw_zenoh_cpp",
-      "Unable to create liveliness token for the publisher.");
-    return nullptr;
-  }
-
   auto pub_data = std::shared_ptr<PublisherData>(
     new PublisherData{
       rmw_publisher,
       node,
       std::move(entity),
-      std::move(session),
-      std::move(token),
       type_support->data,
       std::move(message_type_support),
       use_buffer_endpoints,
       backend_metadata
     });
 
-  // Create the base publisher through the same path as every endpoint,
-  // stored in endpoints_ under the topic key expression.
-  const std::string base_key = pub_data->entity_->topic_info()->topic_keyexpr_;
-  auto base_endpoint = pub_data->create_publisher_endpoint(base_key, /*buffer_aware=*/false);
-  if (!base_endpoint) {
-    RMW_SET_ERROR_MSG("Unable to create Zenoh publisher.");
+  // The graph cache is kept unconditionally: rebind() needs it to move the QoS
+  // event callbacks of this publisher over to its new gid.
+  pub_data->graph_cache_ = context_impl->graph_cache();
+
+  if (!pub_data->declare_on_session(session)) {
+    // Error already handled.
     return nullptr;
   }
-  pub_data->base_endpoint_ = base_endpoint.get();
-  pub_data->endpoints_[base_key] = std::move(base_endpoint);
 
-  if (use_buffer_endpoints) {
-    pub_data->local_endpoint_info_ =
-      build_endpoint_info_from_entity(*pub_data->entity_, RMW_ENDPOINT_PUBLISHER);
+  return pub_data;
+}
 
-    auto * backend_ctx = context_impl->buffer_backend_context();
-    if (backend_ctx) {
-      rosidl_buffer_backend_registry::notify_endpoint_created(
-        backend_ctx->backend_instances, pub_data->local_endpoint_info_.info);
-    }
+///=============================================================================
+bool PublisherData::declare_on_session(const std::shared_ptr<zenoh::Session> & session)
+{
+  // Declare everything on the session first and only then publish the state
+  // under mutex_: a failure part-way through leaves the publisher detached
+  // rather than half-attached.
+  zenoh::ZResult result;
+  auto token = session->liveliness_declare_token(
+    zenoh::KeyExpr(entity_->liveliness_keyexpr()),
+    zenoh::Session::LivelinessDeclarationOptions::create_default(),
+    &result);
+  if (result != Z_OK) {
+    RMW_ZENOH_LOG_ERROR_NAMED(
+      "rmw_zenoh_cpp",
+      "Unable to create liveliness token for the publisher.");
+    return false;
+  }
 
-    // Eagerly create the CPU-group publisher endpoint.  All CPU-only
-    // subscribers share this single channel instead of requiring individual
-    // peer-to-peer endpoints -- mirrors rmw_fastrtps_cpp's eager CPU
-    // DataWriter creation.
-    const std::string cpu_group_key = make_cpu_group_key(
-      pub_data->entity_->topic_info()->topic_keyexpr_);
-    auto cpu_endpoint = pub_data->create_publisher_endpoint(cpu_group_key);
+  // Create the base publisher through the same path as every endpoint,
+  // stored in endpoints_ under the topic key expression.
+  const std::string base_key = entity_->topic_info()->topic_keyexpr_;
+  auto base_endpoint = create_publisher_endpoint(session, base_key, /*buffer_aware=*/false);
+  if (!base_endpoint) {
+    RMW_SET_ERROR_MSG("Unable to create Zenoh publisher.");
+    return false;
+  }
+
+  // Eagerly create the CPU-group publisher endpoint.  All CPU-only
+  // subscribers share this single channel instead of requiring individual
+  // peer-to-peer endpoints -- mirrors rmw_fastrtps_cpp's eager CPU
+  // DataWriter creation.
+  const std::string cpu_group_key = make_cpu_group_key(base_key);
+  std::shared_ptr<PublisherEndpoint> cpu_endpoint;
+  if (is_buffer_aware_) {
+    cpu_endpoint = create_publisher_endpoint(session, cpu_group_key);
     if (!cpu_endpoint) {
       RMW_ZENOH_ROSIDL_BUFFER_LOG_ERROR_NAMED(
         "rmw_zenoh_cpp",
         "Failed to eagerly create CPU-group publisher endpoint for topic '%s'",
-        topic_name.c_str());
-      return nullptr;
+        entity_->topic_info()->name_.c_str());
+      return false;
     }
-    pub_data->endpoints_[cpu_group_key] = std::move(cpu_endpoint);
   }
 
-  // Register discovery callback for Buffer-aware publishers
-  if (use_buffer_endpoints) {
-    pub_data->graph_cache_ = context_impl->graph_cache();
-    if (pub_data->graph_cache_ != nullptr) {
-      std::weak_ptr<PublisherData> weak_pub_data = pub_data;
-      pub_data->graph_cache_->register_subscriber_discovery_callback(
+  std::string topic_name;
+  std::string liveliness_keyexpr;
+  std::size_t gid_hash = 0;
+  EndpointInfoStorage local_endpoint_info;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    sess_ = session;
+    token_ = std::move(token);
+    base_endpoint_ = base_endpoint.get();
+    endpoints_[base_key] = std::move(base_endpoint);
+    if (cpu_endpoint) {
+      endpoints_[cpu_group_key] = std::move(cpu_endpoint);
+    }
+    if (is_buffer_aware_) {
+      local_endpoint_info_ = build_endpoint_info_from_entity(*entity_, RMW_ENDPOINT_PUBLISHER);
+      local_endpoint_info = local_endpoint_info_;
+    }
+    topic_name = entity_->topic_info()->name_;
+    liveliness_keyexpr = entity_->liveliness_keyexpr();
+    gid_hash = entity_->gid_hash();
+  }
+
+  if (is_buffer_aware_) {
+    rmw_context_impl_t * context_impl =
+      static_cast<rmw_context_impl_t *>(rmw_node_->context->impl);
+    auto * backend_ctx = context_impl->buffer_backend_context();
+    if (backend_ctx) {
+      rosidl_buffer_backend_registry::notify_endpoint_created(
+        backend_ctx->backend_instances, local_endpoint_info.info);
+    }
+
+    // Register discovery callback for Buffer-aware publishers. Registration
+    // replays the subscribers already known to the graph, so a publisher that
+    // is being re-declared on a new session picks its peers back up here.
+    if (graph_cache_ != nullptr) {
+      std::weak_ptr<PublisherData> weak_pub_data = weak_from_this();
+      graph_cache_->register_subscriber_discovery_callback(
         topic_name,
-        pub_data->gid_hash(),
+        gid_hash,
         [weak_pub_data](const liveliness::Entity & entity) {
           if (auto pd = weak_pub_data.lock()) {
             pd->on_subscriber_discovered(entity);
@@ -238,11 +272,11 @@ std::shared_ptr<PublisherData> PublisherData::make(
 
       // Manually add this local publisher to the graph cache so local subscribers can discover it
       // Liveliness events from the same session don't trigger graph updates automatically
-      pub_data->graph_cache_->parse_put(pub_data->entity_->liveliness_keyexpr(), false);
+      graph_cache_->parse_put(liveliness_keyexpr, false);
     }
   }
 
-  return pub_data;
+  return true;
 }
 
 ///=============================================================================
@@ -250,8 +284,6 @@ PublisherData::PublisherData(
   const rmw_publisher_t * const rmw_publisher,
   const rmw_node_t * rmw_node,
   std::shared_ptr<liveliness::Entity> entity,
-  std::shared_ptr<zenoh::Session> sess,
-  zenoh::LivelinessToken token,
   const void * type_support_impl,
   std::unique_ptr<MessageTypeSupport> type_support,
   bool is_buffer_aware,
@@ -259,8 +291,6 @@ PublisherData::PublisherData(
 : rmw_publisher_(rmw_publisher),
   rmw_node_(rmw_node),
   entity_(std::move(entity)),
-  sess_(std::move(sess)),
-  token_(std::move(token)),
   type_support_impl_(type_support_impl),
   type_support_(std::move(type_support)),
   sequence_number_(1),
@@ -489,6 +519,11 @@ rmw_ret_t PublisherData::publish(
     RMW_SET_ERROR_MSG("Unable to publish as the publisher has been shutdown.");
     return RMW_RET_ERROR;
   }
+  if (base_endpoint_ == nullptr || sess_ == nullptr) {
+    RMW_SET_ERROR_MSG(
+      "Unable to publish as the publisher is not attached to a zenoh session.");
+    return RMW_RET_ERROR;
+  }
 
   // Buffer-aware publishing strategy (mirrors rmw_fastrtps):
   //   - If ALL matched subscribers are buffer-aware, publish only to
@@ -656,6 +691,11 @@ rmw_ret_t PublisherData::publish_serialized_message(
   std::optional<zenoh::ZShmMut> shm_buf = std::nullopt;
 
   std::lock_guard<std::mutex> lock(mutex_);
+  if (is_shutdown_ || base_endpoint_ == nullptr || sess_ == nullptr) {
+    RMW_SET_ERROR_MSG(
+      "Unable to publish as the publisher is not attached to a zenoh session.");
+    return RMW_RET_ERROR;
+  }
 
   const size_t data_length = ser.get_serialized_data_length();
   // The encoding is simply forwarded and is useful when key expressions in the
@@ -812,11 +852,13 @@ void PublisherData::on_subscriber_discovered(const liveliness::Entity & entity)
   std::vector<rmw_topic_endpoint_info_t> existing_endpoints;
   std::unordered_map<std::string, std::vector<std::set<uint32_t>>> backend_endpoint_groups;
   bool need_create_endpoint = false;
+  std::shared_ptr<zenoh::Session> session;
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!is_buffer_aware_ || is_shutdown_) {
+    if (!is_buffer_aware_ || is_shutdown_ || sess_ == nullptr) {
       return;
     }
+    session = sess_;
 
     for (const auto & existing : discovered_subscribers_) {
       if (memcmp(existing.gid.data, gid.data, RMW_GID_STORAGE_SIZE) == 0) {
@@ -864,7 +906,7 @@ void PublisherData::on_subscriber_discovered(const liveliness::Entity & entity)
 
   std::shared_ptr<PublisherEndpoint> new_endpoint;
   if (need_create_endpoint) {
-    new_endpoint = create_publisher_endpoint(full_key);
+    new_endpoint = create_publisher_endpoint(session, full_key);
     if (!new_endpoint) {
       std::lock_guard<std::mutex> lock(mutex_);
       pending_endpoints_.erase(full_key);
@@ -904,7 +946,7 @@ std::shared_ptr<PublisherData::PublisherEndpoint> PublisherData::get_or_create_e
     return it->second;
   }
 
-  auto endpoint = create_publisher_endpoint(full_key);
+  auto endpoint = create_publisher_endpoint(sess_, full_key);
   if (endpoint) {
     endpoints_[full_key] = endpoint;
   }
@@ -913,8 +955,16 @@ std::shared_ptr<PublisherData::PublisherEndpoint> PublisherData::get_or_create_e
 
 ///=============================================================================
 std::shared_ptr<PublisherData::PublisherEndpoint> PublisherData::create_publisher_endpoint(
+  const std::shared_ptr<zenoh::Session> & session,
   const std::string & full_key, bool buffer_aware)
 {
+  if (session == nullptr) {
+    RMW_ZENOH_ROSIDL_BUFFER_LOG_ERROR_NAMED(
+      "rmw_zenoh_cpp",
+      "Cannot create publisher endpoint for key '%s': no zenoh session.", full_key.c_str());
+    return nullptr;
+  }
+
   auto endpoint = std::make_shared<PublisherEndpoint>();
   endpoint->key = full_key;
 
@@ -957,7 +1007,7 @@ std::shared_ptr<PublisherData::PublisherEndpoint> PublisherData::create_publishe
   adv_pub_opts.publisher_options = pub_opts;
 
   zenoh::ZResult result;
-  auto pub = sess_->ext().declare_advanced_publisher(
+  auto pub = session->ext().declare_advanced_publisher(
       pub_ke, std::move(adv_pub_opts), &result);
 
   if (result != Z_OK) {
@@ -982,6 +1032,102 @@ PublisherData::~PublisherData()
       entity_->topic_info().value().name_.c_str()
     );
   }
+}
+
+///=============================================================================
+void PublisherData::detach_from_session()
+{
+  std::unordered_map<std::string, std::shared_ptr<PublisherEndpoint>> endpoints_to_destroy;
+  std::optional<zenoh::LivelinessToken> token;
+  bool was_buffer_aware = false;
+  std::size_t gid_hash = 0;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (is_shutdown_) {
+      return;
+    }
+    was_buffer_aware = is_buffer_aware_;
+    gid_hash = entity_->gid_hash();
+    base_endpoint_ = nullptr;
+    endpoints_to_destroy = std::move(endpoints_);
+    endpoints_.clear();
+    pending_endpoints_.clear();
+    // Matched subscribers are relearnt from the graph once the publisher is
+    // re-declared, so the per-subscriber endpoints are not worth preserving.
+    discovered_subscribers_.clear();
+    token = std::move(token_);
+    token_.reset();
+    sess_.reset();
+  }
+
+  // The discovery callback is keyed by gid hash, which changes when the
+  // publisher is re-declared, so drop the old registration here and let
+  // declare_on_session() install a fresh one.
+  if (was_buffer_aware && graph_cache_ != nullptr) {
+    graph_cache_->unregister_discovery_callbacks(gid_hash);
+  }
+
+  zenoh::ZResult result;
+  for (auto & [key, endpoint] : endpoints_to_destroy) {
+    if (endpoint->pub.has_value()) {
+      std::move(endpoint->pub.value()).undeclare(&result);
+      if (result != Z_OK) {
+        RMW_ZENOH_ROSIDL_BUFFER_LOG_ERROR_NAMED(
+          "rmw_zenoh_cpp",
+          "Failed to undeclare endpoint with key '%s' while detaching", key.c_str());
+      }
+    }
+  }
+
+  if (token.has_value()) {
+    std::move(token.value()).undeclare(&result);
+    if (result != Z_OK) {
+      RMW_ZENOH_LOG_ERROR_NAMED(
+        "rmw_zenoh_cpp",
+        "Unable to undeclare the liveliness token for topic '%s' while detaching",
+        entity_->topic_info().value().name_.c_str());
+    }
+  }
+}
+
+///=============================================================================
+bool PublisherData::rebind(const std::shared_ptr<zenoh::Session> & session)
+{
+  std::size_t old_gid_hash = 0;
+  std::size_t new_gid_hash = 0;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (is_shutdown_) {
+      // A publisher destroyed during the reconfiguration window stays destroyed.
+      return true;
+    }
+    old_gid_hash = entity_->gid_hash();
+    // The liveliness keyexpr -- and therefore the gid derived from it -- embeds
+    // the zenoh session id, so the entity has to be rebuilt for the new session.
+    auto entity = liveliness::Entity::make(
+      session->get_zid(),
+      entity_->nid(),
+      entity_->id(),
+      liveliness::EntityType::Publisher,
+      entity_->node_info(),
+      entity_->topic_info());
+    if (entity == nullptr) {
+      RMW_ZENOH_LOG_ERROR_NAMED(
+        "rmw_zenoh_cpp",
+        "Unable to rebuild the entity for publisher %s on the new zenoh session.",
+        entity_->topic_info().value().name_.c_str());
+      return false;
+    }
+    entity_ = std::move(entity);
+    new_gid_hash = entity_->gid_hash();
+  }
+
+  // Carry the user's event callbacks over to the new gid.
+  if (graph_cache_ != nullptr) {
+    graph_cache_->remap_entity_gid_hash(old_gid_hash, new_gid_hash);
+  }
+
+  return declare_on_session(session);
 }
 
 ///=============================================================================
@@ -1019,13 +1165,17 @@ rmw_ret_t PublisherData::shutdown()
     }
   }
 
-  std::move(token_).value().undeclare(&result);
-  if (result != Z_OK) {
-    RMW_ZENOH_LOG_ERROR_NAMED(
-      "rmw_zenoh_cpp",
-      "Unable to undeclare the liveliness token for topic '%s'",
-      entity_->topic_info().value().name_.c_str());
-    return RMW_RET_ERROR;
+  // token_ is empty while the publisher is detached from a session, which is
+  // the case between the teardown and re-declare halves of a reconfiguration.
+  if (token_.has_value()) {
+    std::move(token_).value().undeclare(&result);
+    if (result != Z_OK) {
+      RMW_ZENOH_LOG_ERROR_NAMED(
+        "rmw_zenoh_cpp",
+        "Unable to undeclare the liveliness token for topic '%s'",
+        entity_->topic_info().value().name_.c_str());
+      return RMW_RET_ERROR;
+    }
   }
 
   sess_.reset();
