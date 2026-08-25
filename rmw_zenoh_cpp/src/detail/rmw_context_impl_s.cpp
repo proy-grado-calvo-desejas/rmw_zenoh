@@ -32,6 +32,7 @@
 
 #include <zenoh.hxx>
 
+#include "admin_channel.hpp"
 #include "buffer_backend_context.hpp"
 #include "buffer_backend_loader.hpp"
 #include "graph_cache.hpp"
@@ -99,6 +100,13 @@ public:
       std::memory_order_relaxed))
     {
       return ret;
+    }
+
+    // Stop accepting reconfigurations first: the worker thread reaches into
+    // everything below, so it must be joined before any of it goes away.
+    if (admin_channel_ != nullptr) {
+      admin_channel_->stop();
+      admin_channel_->undeclare();
     }
 
     // Take the exclusive session lock so that shutdown cannot interleave with
@@ -346,6 +354,9 @@ public:
     }
 
     // Step 2: drop the context's own handles and the session itself.
+    if (admin_channel_ != nullptr) {
+      admin_channel_->undeclare();
+    }
     static_cast<void>(undeclare_graph_subscriber());
     {
       std::shared_ptr<zenoh::Session> old_session;
@@ -417,6 +428,11 @@ public:
       ok = node_data->rebind(session) && ok;
     }
 
+    // Step 6: re-declare the admin channel so the process can be reconfigured again.
+    if (admin_channel_ != nullptr) {
+      admin_channel_->declare_on_session(session, bundle->config_json5, reconfigure_time);
+    }
+
     // The graph changed wholesale; wake anyone waiting on it.
     const rmw_ret_t trigger_ret = rmw_trigger_guard_condition(graph_guard_condition_.get());
     if (RMW_RET_OK != trigger_ret) {
@@ -441,6 +457,14 @@ public:
       "[reconfigure] The zenoh session was rebuilt; new session id is %s.",
       session->get_zid().to_string().c_str());
     return RMW_RET_OK;
+  }
+
+  // Publish the outcome of a reconfiguration attempt on the admin ack key.
+  void publish_reconfigure_ack(bool success, const std::string & error)
+  {
+    if (admin_channel_ != nullptr) {
+      admin_channel_->publish_ack(success, error);
+    }
   }
 
   // Destructor.
@@ -793,6 +817,24 @@ private:
       RMW_SET_ERROR_MSG("unable to create zenoh subscription");
       throw std::runtime_error("Unable to subscribe to ROS graph updates.");
     }
+
+    // Bring up the reconfiguration control channel. A process that cannot
+    // declare it still works, it just cannot be reconfigured remotely, so a
+    // failure here is logged by the channel rather than fatal.
+    std::weak_ptr<Data> data_wp = shared_from_this();
+    admin_channel_ = std::make_unique<rmw_zenoh_cpp::AdminChannel>(
+      domain_id_,
+      [data_wp](const std::string & config_json5) {
+        std::shared_ptr<Data> data = data_wp.lock();
+        if (data == nullptr) {
+          return;
+        }
+        std::string error;
+        const rmw_ret_t ret = data->reconfigure(config_json5, error);
+        data->publish_reconfigure_ack(ret == RMW_RET_OK, error);
+      });
+    admin_channel_->start();
+    admin_channel_->declare_on_session(session_, session_config_, 0);
   }
 
   // Setup the liveliness subscriber that receives updates from the ROS graph
@@ -888,6 +930,9 @@ private:
   // liveliness_declare_subscriber() throws an exception if it fails,
   // so this should all be safe to do.
   std::optional<zenoh::Subscriber<void>> graph_subscriber_;
+  // The control channel a zenoh router plugin uses to push a new session
+  // configuration into this process.
+  std::unique_ptr<rmw_zenoh_cpp::AdminChannel> admin_channel_;
   // Equivalent to rmw_dds_common::Context's guard condition.
   // Guard condition that should be triggered when the graph changes.
   std::unique_ptr<rmw_guard_condition_t> graph_guard_condition_;
