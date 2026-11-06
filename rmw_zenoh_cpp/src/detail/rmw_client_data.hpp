@@ -32,6 +32,7 @@
 #include "liveliness_utils.hpp"
 #include "message_type_support.hpp"
 #include "service_type_support.hpp"
+#include "session_lock.hpp"
 #include "type_support_common.hpp"
 #include "zenoh_utils.hpp"
 
@@ -97,6 +98,21 @@ public:
   // Check if this ClientData is shutdown.
   bool is_shutdown() const;
 
+  // Undeclare the querier and the liveliness token without destroying the
+  // ClientData itself, so that the rmw_client_t handed to the application stays
+  // valid. Replies that have arrived but not yet been taken are dropped, and
+  // requests still in flight are abandoned: the caller sees them as unanswered.
+  void detach_from_session();
+
+  // Re-declare the querier and the liveliness token on `session`.
+  // The liveliness Entity is rebuilt so that it advertises the id of the new
+  // session, which also changes the zenoh-level gid of this client.
+  bool rebind(const std::shared_ptr<zenoh::Session> & session);
+
+  // Acquire a shared lock on the Zenoh session of the context that owns this
+  // client. Held by RMW entry points for the duration of a call.
+  SessionReadLock lock_session() const;
+
   // Destructor.
   ~ClientData();
 
@@ -106,8 +122,6 @@ private:
     const rmw_node_t * rmw_node,
     const rmw_client_t * client,
     std::shared_ptr<liveliness::Entity> entity,
-    std::shared_ptr<zenoh::Session> sess,
-    zenoh::Querier querier_,
     const void * request_type_support_impl,
     const void * response_type_support_impl,
     std::shared_ptr<RequestTypeSupport> request_type_support,
@@ -115,6 +129,10 @@ private:
 
   // Shutdown this ClientData.
   rmw_ret_t shutdown();
+
+  // Declare the querier and the liveliness token on `session`.
+  // Used by both make() and rebind().
+  bool declare_on_session(const std::shared_ptr<zenoh::Session> & session);
 
   // Internal mutex.
   mutable std::mutex mutex_;
@@ -126,8 +144,12 @@ private:
   std::shared_ptr<liveliness::Entity> entity_;
   // A shared session.
   std::shared_ptr<zenoh::Session> sess_;
-  // Zenoh querier
-  zenoh::Querier querier_;
+  // Zenoh querier.
+  // Held through a shared_ptr rather than by value so that send_request() can
+  // keep it alive across the window in which it deliberately drops mutex_
+  // (see https://github.com/ros2/rmw_zenoh/issues/484), and so that it can be
+  // replaced when the client is re-declared on a new session.
+  std::shared_ptr<zenoh::Querier> querier_;
   // Liveliness token for the service.
   std::optional<zenoh::LivelinessToken> token_;
   // Type support fields.

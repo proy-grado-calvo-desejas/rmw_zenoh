@@ -14,6 +14,7 @@
 
 #include "rmw_context_impl_s.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -21,14 +22,17 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include <zenoh.hxx>
 
+#include "admin_channel.hpp"
 #include "buffer_backend_context.hpp"
 #include "buffer_backend_loader.hpp"
 #include "graph_cache.hpp"
@@ -36,6 +40,7 @@
 #include "identifier.hpp"
 #include "logging_macros.hpp"
 #include "rmw_node_data.hpp"
+#include "session_lock.hpp"
 #include "zenoh_config.hpp"
 
 #include "rcpputils/scope_exit.hpp"
@@ -60,6 +65,15 @@ static const char * CONFIG_KEY_SHM_POOL_SIZE =
 static const char * CONFIG_KEY_SHM_THRESHOLD_SIZE =
   "transport/shared_memory/transport_optimization/message_size_threshold";
 
+
+// Upper bound on the number of attempts to find a zenoh router when rebuilding
+// the session during a reconfiguration. ZENOH_ROUTER_CHECK_ATTEMPTS can ask the
+// initial connection to wait indefinitely, but a reconfiguration runs while
+// holding the exclusive session lock, so every RMW call in the process is
+// blocked behind it. The user's setting is honoured up to this cap so that a
+// configuration pointing at an unreachable router costs seconds rather than
+// freezing the process.
+static constexpr uint64_t MAX_RECONFIGURE_ROUTER_CHECK_ATTEMPTS = 10;
 
 // Bundle all class members into a data struct which can be passed as a
 // weak ptr to various threads for thread-safe access without capturing
@@ -88,14 +102,18 @@ public:
       return ret;
     }
 
-    zenoh::ZResult result;
-    // no synchronization is needed here since undeclare will block
-    // until inflight callbacks are finished
-    std::move(graph_subscriber_).value().undeclare(&result);
-    if (result != Z_OK) {
-      RMW_ZENOH_LOG_ERROR_NAMED(
-        "rmw_zenoh_cpp",
-        "Unable to undeclare the liveliness token");
+    // Stop accepting reconfigurations first: the worker thread reaches into
+    // everything below, so it must be joined before any of it goes away.
+    if (admin_channel_ != nullptr) {
+      admin_channel_->stop();
+      admin_channel_->undeclare();
+    }
+
+    // Take the exclusive session lock so that shutdown cannot interleave with
+    // an RMW call that is already using the session.
+    std::unique_lock<std::shared_mutex> session_lock(session_mutex_);
+
+    if (!undeclare_graph_subscriber()) {
       return RMW_RET_ERROR;
     }
 
@@ -111,9 +129,15 @@ public:
     // immediately. The session is then marked as closed, so when the shared_ptr refcount
     // eventually reaches zero (after rcl destroys each handle in the normal teardown order),
     // the session destructor finds is_closed()==true and skips the blocking close() call.
-    session_->close();
-
-    session_.reset();
+    std::shared_ptr<zenoh::Session> session;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      session = std::move(session_);
+      session_.reset();
+    }
+    if (session != nullptr) {
+      session->close();
+    }
 
     return RMW_RET_OK;
   }
@@ -123,13 +147,20 @@ public:
     return enclave_;
   }
 
+  std::size_t domain_id() const
+  {
+    return domain_id_;
+  }
+
   const std::shared_ptr<zenoh::Session> session() const
   {
+    std::lock_guard<std::mutex> lock(mutex_);
     return session_;
   }
 
   const std::shared_ptr<rmw_zenoh_cpp::ShmContext> shm() const
   {
+    std::lock_guard<std::mutex> lock(mutex_);
     return shm_;
   }
 
@@ -150,7 +181,10 @@ public:
 
   bool session_is_valid() const
   {
-    return !session_->is_closed();
+    std::lock_guard<std::mutex> lock(mutex_);
+    // session_ is null between the teardown and re-declare halves of a
+    // reconfiguration, and stays null if the session could not be rebuilt.
+    return session_ != nullptr && !session_->is_closed();
   }
 
   std::shared_ptr<rmw_zenoh_cpp::GraphCache> graph_cache()
@@ -168,6 +202,23 @@ public:
     return buffer_backend_context_.get();
   }
 
+  rmw_zenoh_cpp::SessionReadLock lock_session_shared() const
+  {
+    return rmw_zenoh_cpp::SessionReadLock(session_mutex_);
+  }
+
+  std::string session_config() const
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return session_config_;
+  }
+
+  int64_t last_reconfigure_time() const
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_reconfigure_time_;
+  }
+
   bool create_node_data(
     const rmw_node_t * const node,
     const std::string & ns,
@@ -180,7 +231,7 @@ public:
     }
 
     // Check that the Zenoh session is still valid.
-    if (!session_is_valid()) {
+    if (session_ == nullptr || session_->is_closed()) {
       RMW_ZENOH_LOG_ERROR_NAMED(
         "rmw_zenoh_cpp",
         "Unable to create NodeData as Zenoh session is invalid.");
@@ -190,7 +241,7 @@ public:
     auto node_data = rmw_zenoh_cpp::NodeData::make(
       node,
       this->get_next_entity_id(),
-      session(),
+      session_,
       domain_id_,
       ns,
       node_name,
@@ -247,6 +298,175 @@ public:
     }
   }
 
+  ///===========================================================================
+  /// Tear down the current Zenoh session and rebuild it from `config_json5`.
+  /// See rmw_context_impl_s::reconfigure() for the contract.
+  rmw_ret_t reconfigure(const std::string & config_json5, std::string & error)
+  {
+    if (is_shutdown()) {
+      error = "the context has been shut down";
+      return RMW_RET_ERROR;
+    }
+
+    // Validate the payload before tearing anything down, so that a malformed
+    // configuration costs nothing more than an error on the ack channel.
+    {
+      zenoh::ZResult result;
+      zenoh::Config candidate = zenoh::Config::from_str(config_json5, &result);
+      static_cast<void>(candidate);
+      if (result != Z_OK) {
+        error = "the payload is not a valid zenoh json5 configuration";
+        RMW_ZENOH_LOG_ERROR_NAMED("rmw_zenoh_cpp", "[reconfigure] %s.", error.c_str());
+        return RMW_RET_INVALID_ARGUMENT;
+      }
+    }
+
+    // Block every RMW operation that touches the session for the duration.
+    std::unique_lock<std::shared_mutex> session_lock(session_mutex_);
+
+    if (is_shutdown()) {
+      error = "the context has been shut down";
+      return RMW_RET_ERROR;
+    }
+
+    std::string previous_config;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      previous_config = session_config_;
+    }
+
+    RMW_ZENOH_LOG_INFO_NAMED(
+      "rmw_zenoh_cpp", "[reconfigure] Rebuilding the zenoh session.");
+
+    // Step 1: snapshot the nodes and detach every entity they own. This runs
+    // while the old session is still alive so that the undeclarations reach the
+    // network and remote peers see the entities go away cleanly.
+    std::vector<std::shared_ptr<rmw_zenoh_cpp::NodeData>> nodes;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      nodes.reserve(nodes_.size());
+      for (const auto & entry : nodes_) {
+        nodes.push_back(entry.second);
+      }
+    }
+    for (const auto & node_data : nodes) {
+      node_data->detach_from_session();
+    }
+
+    // Step 2: drop the context's own handles and the session itself.
+    if (admin_channel_ != nullptr) {
+      admin_channel_->undeclare();
+    }
+    static_cast<void>(undeclare_graph_subscriber());
+    {
+      std::shared_ptr<zenoh::Session> old_session;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        old_session = std::move(session_);
+        session_.reset();
+        shm_.reset();
+      }
+      if (old_session != nullptr) {
+        old_session->close();
+      }
+    }
+
+    // Step 3: open the new session, falling back to the previous configuration
+    // if it cannot be opened.
+    const std::optional<uint64_t> router_check_attempts = reconfigure_router_check_attempts();
+    std::string open_error;
+    std::optional<SessionBundle> bundle =
+      open_session(config_json5, router_check_attempts, open_error);
+    bool rolled_back = false;
+    if (!bundle.has_value()) {
+      RMW_ZENOH_LOG_ERROR_NAMED(
+        "rmw_zenoh_cpp",
+        "[reconfigure] Unable to open a session with the new configuration (%s). "
+        "Rolling back to the previous configuration.", open_error.c_str());
+      std::string rollback_error;
+      bundle = open_session(previous_config, router_check_attempts, rollback_error);
+      rolled_back = true;
+      if (!bundle.has_value()) {
+        error = "unable to open a session with the new configuration (" + open_error +
+          ") and unable to restore the previous one (" + rollback_error +
+          "); this context no longer has a session";
+        RMW_ZENOH_LOG_ERROR_NAMED("rmw_zenoh_cpp", "[reconfigure] %s.", error.c_str());
+        return RMW_RET_ERROR;
+      }
+    }
+
+    const std::shared_ptr<zenoh::Session> session = bundle->session;
+    int64_t reconfigure_time = rmw_zenoh_cpp::get_system_time_in_ns();
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      session_ = session;
+      shm_ = bundle->shm;
+      session_config_ = bundle->config_json5;
+      last_reconfigure_time_ = reconfigure_time;
+    }
+
+    // Step 4: re-key the graph cache onto the new session and repopulate it.
+    // reset() removes every entity through the regular deletion path first, so
+    // the application sees a matching unmatched event for everything that was
+    // matched before.
+    graph_cache_->reset(session->get_zid());
+    if (!declare_graph_subscriber(session)) {
+      error = "the session was rebuilt but the ROS graph subscriber could not be re-declared";
+      RMW_ZENOH_LOG_ERROR_NAMED("rmw_zenoh_cpp", "[reconfigure] %s.", error.c_str());
+      return RMW_RET_ERROR;
+    }
+    if (!prime_graph_cache(session)) {
+      RMW_ZENOH_LOG_WARN_NAMED(
+        "rmw_zenoh_cpp",
+        "[reconfigure] Unable to query the ROS graph on the new session; the graph "
+        "cache will fill in as liveliness tokens arrive.");
+    }
+
+    // Step 5: put every ROS entity back on the new session.
+    bool ok = true;
+    for (const auto & node_data : nodes) {
+      ok = node_data->rebind(session) && ok;
+    }
+
+    // Step 6: re-declare the admin channel so the process can be reconfigured again.
+    if (admin_channel_ != nullptr) {
+      admin_channel_->declare_on_session(session, bundle->config_json5, reconfigure_time);
+    }
+
+    // The graph changed wholesale; wake anyone waiting on it.
+    const rmw_ret_t trigger_ret = rmw_trigger_guard_condition(graph_guard_condition_.get());
+    if (RMW_RET_OK != trigger_ret) {
+      RMW_ZENOH_LOG_WARN_NAMED(
+        "rmw_zenoh_cpp",
+        "[reconfigure] Unable to trigger the graph guard condition.");
+    }
+
+    if (rolled_back) {
+      error = "unable to open a session with the new configuration (" + open_error +
+        "); the previous configuration was restored";
+      return RMW_RET_ERROR;
+    }
+    if (!ok) {
+      error = "the session was rebuilt but at least one ROS entity could not be re-declared";
+      RMW_ZENOH_LOG_ERROR_NAMED("rmw_zenoh_cpp", "[reconfigure] %s.", error.c_str());
+      return RMW_RET_ERROR;
+    }
+
+    RMW_ZENOH_LOG_INFO_NAMED(
+      "rmw_zenoh_cpp",
+      "[reconfigure] The zenoh session was rebuilt; new session id is %s.",
+      session->get_zid().to_string().c_str());
+    return RMW_RET_OK;
+  }
+
+  // Publish the outcome of a reconfiguration attempt on the admin ack key.
+  void publish_reconfigure_ack(bool success, const std::string & error)
+  {
+    if (admin_channel_ != nullptr) {
+      admin_channel_->publish_ack(success, error);
+    }
+  }
+
   // Destructor.
   ~Data()
   {
@@ -256,23 +476,59 @@ public:
   }
 
 private:
-  // Private Constructor, to force the use of the make() method which returns a shared_ptr.
-  Data(
-    std::size_t domain_id,
-    const std::string & enclave)
-  : domain_id_(domain_id),
-    enclave_(enclave),
-    is_shutdown_(false),
-    next_entity_id_(0),
-    nodes_({}),
-    liveliness_keyexpr_(rmw_zenoh_cpp::liveliness::subscription_token(domain_id))
+  // How long to look for a zenoh router when rebuilding the session, honouring
+  // the user's ZENOH_ROUTER_CHECK_ATTEMPTS up to
+  // MAX_RECONFIGURE_ROUTER_CHECK_ATTEMPTS.
+  static std::optional<uint64_t> reconfigure_router_check_attempts()
   {
-    // Initialize the zenoh configuration.
-    std::optional<zenoh::Config> config = rmw_zenoh_cpp::get_z_config(
-      rmw_zenoh_cpp::ConfigurableEntity::Session);
+    const std::optional<uint64_t> configured = rmw_zenoh_cpp::zenoh_router_check_attempts();
+    if (!configured.has_value()) {
+      return std::nullopt;
+    }
+    return std::min(configured.value(), MAX_RECONFIGURE_ROUTER_CHECK_ATTEMPTS);
+  }
 
-    if (!config.has_value()) {
-      throw std::runtime_error("Error configuring Zenoh session.");
+  // Everything that is created together with a zenoh session and has to be
+  // replaced together with it.
+  struct SessionBundle
+  {
+    std::shared_ptr<zenoh::Session> session;
+    // Null when shared memory is disabled in the configuration.
+    std::shared_ptr<rmw_zenoh_cpp::ShmContext> shm;
+    // The configuration the session was actually opened with, after the
+    // environment variable overrides below were applied. This is what is served
+    // on the current_config key and what a failed reconfiguration rolls back to.
+    std::string config_json5;
+  };
+
+  /// Open a zenoh session.
+  /// @param config_json5 The configuration to use. std::nullopt loads it from
+  ///   ZENOH_SESSION_CONFIG_URI or the packaged default, which is what the
+  ///   process does at startup.
+  /// @param router_check_attempts How many times to look for a zenoh router
+  ///   before giving up and proceeding anyway. std::nullopt skips the check.
+  /// @param error Set to a human readable reason on failure.
+  static std::optional<SessionBundle> open_session(
+    const std::optional<std::string> & config_json5,
+    std::optional<uint64_t> router_check_attempts,
+    std::string & error)
+  {
+    zenoh::ZResult result;
+
+    std::optional<zenoh::Config> config;
+    if (config_json5.has_value()) {
+      zenoh::Config parsed = zenoh::Config::from_str(config_json5.value(), &result);
+      if (result != Z_OK) {
+        error = "the configuration is not a valid zenoh json5 document";
+        return std::nullopt;
+      }
+      config = std::move(parsed);
+    } else {
+      config = rmw_zenoh_cpp::get_z_config(rmw_zenoh_cpp::ConfigurableEntity::Session);
+      if (!config.has_value()) {
+        error = "unable to load the zenoh session configuration";
+        return std::nullopt;
+      }
     }
 
     // Insert or replace some Config parameters based on environment variables.
@@ -299,8 +555,6 @@ private:
           std::to_string(shm_threshold.value()));
       }
     }
-
-    zenoh::ZResult result;
 
     // Get shm configuration.
     bool shm_enabled = false;
@@ -400,27 +654,31 @@ private:
       }
     }
 
+    // Snapshot the configuration as it will actually be used, so that a later
+    // reconfiguration can roll back to exactly this.
+    SessionBundle bundle;
+    bundle.config_json5 = config.value().to_string();
+
     // Initialize the zenoh session.
-    session_ = std::make_shared<zenoh::Session>(
+    bundle.session = std::make_shared<zenoh::Session>(
       std::move(config.value()),
       zenoh::Session::SessionOptions::create_default(),
       &result);
     if (result != Z_OK) {
-      throw std::runtime_error("Error setting up zenoh session. ");
+      error = "unable to open the zenoh session";
+      return std::nullopt;
     }
 
     // Verify if the zenoh router is running if configured.
-    const std::optional<uint64_t> configured_connection_attempts =
-      rmw_zenoh_cpp::zenoh_router_check_attempts();
-    if (configured_connection_attempts.has_value()) {
+    if (router_check_attempts.has_value()) {
       uint64_t connection_attempts = 0;
       // Retry until the connection is successful.
       constexpr std::chrono::milliseconds sleep_time(1000);
       constexpr int64_t ticks_between_print(std::chrono::milliseconds(1000) / sleep_time);
       do {
-        zenoh::ZResult result;
-        const auto zids = this->session_->get_routers_z_id(&result);
-        if (result == Z_OK && !zids.empty()) {
+        zenoh::ZResult check_result;
+        const auto zids = bundle.session->get_routers_z_id(&check_result);
+        if (check_result == Z_OK && !zids.empty()) {
           break;
         }
         if ((connection_attempts % ticks_between_print) == 0) {
@@ -429,7 +687,7 @@ private:
             "Unable to connect to a Zenoh router. "
             "Have you started a router with `ros2 run rmw_zenoh_cpp rmw_zenohd`?");
         }
-        if (++connection_attempts >= configured_connection_attempts.value()) {
+        if (++connection_attempts >= router_check_attempts.value()) {
           RMW_ZENOH_LOG_WARN_NAMED(
             "rmw_zenoh_cpp",
             "Unable to connect to a Zenoh router after %zu attempt(s). "
@@ -438,18 +696,74 @@ private:
             "setting the ZENOH_ROUTER_CHECK_ATTEMPTS environment variable. "
             "Proceeding with initialization but other peers will not discover "
             "or receive data from peers in this session until a router is started.",
-            configured_connection_attempts.value());
+            router_check_attempts.value());
           break;
         }
         std::this_thread::sleep_for(sleep_time);
-      } while(connection_attempts < configured_connection_attempts.value());
+      } while(connection_attempts < router_check_attempts.value());
     }
+
+    // Initialize the shm subsystem if shared_memory is enabled in the config
+    if (shm_enabled) {
+      RMW_ZENOH_LOG_DEBUG_NAMED("rmw_zenoh_cpp",
+        "SHM is enabled - allocated size: %d - msg size threshold: %d",
+        shm_pool_size,
+        msgsize_threshold);
+
+      bundle.shm = std::make_shared<rmw_zenoh_cpp::ShmContext>(
+          msgsize_threshold
+      );
+    } else {
+      RMW_ZENOH_LOG_DEBUG_NAMED("rmw_zenoh_cpp", "SHM is disabled");
+    }
+
+    return bundle;
+  }
+
+  // Private Constructor, to force the use of the make() method which returns a shared_ptr.
+  Data(
+    std::size_t domain_id,
+    const std::string & enclave)
+  : domain_id_(domain_id),
+    enclave_(enclave),
+    is_shutdown_(false),
+    next_entity_id_(0),
+    nodes_({}),
+    liveliness_keyexpr_(rmw_zenoh_cpp::liveliness::subscription_token(domain_id))
+  {
+    std::string error;
+    std::optional<SessionBundle> bundle = open_session(
+      std::nullopt, rmw_zenoh_cpp::zenoh_router_check_attempts(), error);
+    if (!bundle.has_value()) {
+      throw std::runtime_error("Error setting up zenoh session: " + error);
+    }
+    session_ = bundle->session;
+    shm_ = bundle->shm;
+    session_config_ = bundle->config_json5;
 
     // Initialize the graph cache.
     graph_cache_ =
-      std::make_shared<rmw_zenoh_cpp::GraphCache>(this->session_->get_zid());
-    // Setup liveliness subscriptions for discovery.
-    // Query router/liveliness participants to get graph information before the session was started.
+      std::make_shared<rmw_zenoh_cpp::GraphCache>(session_->get_zid());
+    if (!prime_graph_cache(session_)) {
+      throw std::runtime_error("Error getting liveliness. ");
+    }
+
+    graph_guard_condition_ = std::make_unique<rmw_guard_condition_t>();
+    graph_guard_condition_->implementation_identifier = rmw_zenoh_cpp::rmw_zenoh_identifier;
+    graph_guard_condition_->data = &guard_condition_data_;
+
+    // Initialize the serialization buffer pool.
+    serialization_buffer_pool_ = std::make_shared<rmw_zenoh_cpp::BufferPool>();
+
+    // Initialize the buffer backend context.
+    buffer_backend_context_ = std::make_unique<rmw_zenoh_cpp::BufferBackendContext>();
+    rmw_zenoh_cpp::initialize_buffer_backends(*buffer_backend_context_);
+  }
+
+  // Query router/liveliness participants to get graph information from before
+  // this session was started.
+  bool prime_graph_cache(const std::shared_ptr<zenoh::Session> & session)
+  {
     // We create a blocking channel that is unbounded, ie. `bound` = 0, to receive
     // replies for the z_liveliness_get() call. This is necessary as if the `bound`
     // is too low, the channel may starve the zenoh executor of its threads which
@@ -467,18 +781,17 @@ private:
 
     // Intuitively use a FIFO channel rather than building it up with a closure and a
     // handler to FIFO channel
-    zenoh::Session::GetOptions options = zenoh::Session::GetOptions::create_default();
-    options.target = zenoh::QueryTarget::Z_QUERY_TARGET_ALL;
-    options.payload = "";
-
-    auto replies = session_->liveliness_get(
+    zenoh::ZResult result;
+    auto replies = session->liveliness_get(
       liveliness_keyexpr_,
       zenoh::channels::FifoChannel(SIZE_MAX - 1),
       zenoh::Session::LivelinessGetOptions::create_default(),
       &result);
 
     if (result != Z_OK) {
-      throw std::runtime_error("Error getting liveliness. ");
+      RMW_ZENOH_LOG_ERROR_NAMED(
+        "rmw_zenoh_cpp", "[rmw_context_impl_s] Error getting liveliness.");
+      return false;
     }
 
     for (auto res = replies.recv(); std::holds_alternative<zenoh::Reply>(res);
@@ -494,44 +807,47 @@ private:
       }
     }
 
-    // Initialize the shm subsystem if shared_memory is enabled in the config
-    if (shm_enabled) {
-      RMW_ZENOH_LOG_DEBUG_NAMED("rmw_zenoh_cpp",
-        "SHM is enabled - allocated size: %d - msg size threshold: %d",
-        shm_pool_size,
-        msgsize_threshold);
-
-      shm_ = std::make_shared<rmw_zenoh_cpp::ShmContext>(
-          msgsize_threshold
-      );
-    } else {
-      RMW_ZENOH_LOG_DEBUG_NAMED("rmw_zenoh_cpp", "SHM is disabled");
-    }
-
-    graph_guard_condition_ = std::make_unique<rmw_guard_condition_t>();
-    graph_guard_condition_->implementation_identifier = rmw_zenoh_cpp::rmw_zenoh_identifier;
-    graph_guard_condition_->data = &guard_condition_data_;
-
-    // Initialize the serialization buffer pool.
-    serialization_buffer_pool_ = std::make_shared<rmw_zenoh_cpp::BufferPool>();
-
-    // Initialize the buffer backend context.
-    buffer_backend_context_ = std::make_unique<rmw_zenoh_cpp::BufferBackendContext>();
-    rmw_zenoh_cpp::initialize_buffer_backends(*buffer_backend_context_);
+    return true;
   }
 
   void init()
   {
-    // Setup the liveliness subscriber to receives updates from the ROS graph
-    // and update the graph cache.
+    // This can't be in the constructor since shared_from_this() doesn't work there.
+    if (!declare_graph_subscriber(session_)) {
+      RMW_SET_ERROR_MSG("unable to create zenoh subscription");
+      throw std::runtime_error("Unable to subscribe to ROS graph updates.");
+    }
+
+    // Bring up the reconfiguration control channel. A process that cannot
+    // declare it still works, it just cannot be reconfigured remotely, so a
+    // failure here is logged by the channel rather than fatal.
+    std::weak_ptr<Data> data_wp = shared_from_this();
+    admin_channel_ = std::make_unique<rmw_zenoh_cpp::AdminChannel>(
+      domain_id_,
+      [data_wp](const std::string & config_json5) {
+        std::shared_ptr<Data> data = data_wp.lock();
+        if (data == nullptr) {
+          return;
+        }
+        std::string error;
+        const rmw_ret_t ret = data->reconfigure(config_json5, error);
+        data->publish_reconfigure_ack(ret == RMW_RET_OK, error);
+      });
+    admin_channel_->start();
+    admin_channel_->declare_on_session(session_, session_config_, 0);
+  }
+
+  // Setup the liveliness subscriber that receives updates from the ROS graph
+  // and updates the graph cache.
+  bool declare_graph_subscriber(const std::shared_ptr<zenoh::Session> & session)
+  {
     zenoh::Session::LivelinessSubscriberOptions sub_options =
       zenoh::Session::LivelinessSubscriberOptions::create_default();
     sub_options.history = true;
 
-    // This can't be in the constructor since shared_from_this() doesn't work there.
-    std::weak_ptr<Data> context_impl_data_wp = shared_from_this();
+    std::weak_ptr<Data> context_impl_data_wp = weak_from_this();
     zenoh::ZResult result;
-    graph_subscriber_ = session_->liveliness_declare_subscriber(
+    auto subscriber = session->liveliness_declare_subscriber(
       liveliness_keyexpr_,
       [context_impl_data_wp](const zenoh::Sample & sample) {
         // Update the graph cache.
@@ -549,19 +865,53 @@ private:
       &result);
 
     if (result != Z_OK) {
-      RMW_SET_ERROR_MSG("unable to create zenoh subscription");
-      throw std::runtime_error("Unable to subscribe to ROS graph updates.");
+      return false;
     }
+
+    graph_subscriber_ = std::move(subscriber);
+    return true;
+  }
+
+  // Undeclare the ROS graph liveliness subscriber if it is declared.
+  // No synchronization is needed: undeclare blocks until in-flight callbacks
+  // have finished.
+  bool undeclare_graph_subscriber()
+  {
+    if (!graph_subscriber_.has_value()) {
+      return true;
+    }
+    zenoh::ZResult result;
+    std::move(graph_subscriber_).value().undeclare(&result);
+    graph_subscriber_.reset();
+    if (result != Z_OK) {
+      RMW_ZENOH_LOG_ERROR_NAMED(
+        "rmw_zenoh_cpp",
+        "Unable to undeclare the liveliness token");
+      return false;
+    }
+    return true;
   }
 
   // Mutex to lock when accessing members.
   mutable std::mutex mutex_;
+  // Reader/writer lock over the zenoh session. RMW operations that touch
+  // session-owned handles take it shared; reconfigure() takes it exclusively
+  // while it swaps the session out from under them.
+  mutable std::shared_mutex session_mutex_;
   // The ROS domain id of this context.
   std::size_t domain_id_;
   // Enclave, name used to find security artifacts in a sros2 keystore.
   std::string enclave_;
-  // An owned session.
+  // An owned session. Null between the teardown and re-declare halves of a
+  // reconfiguration, and after shutdown.
   std::shared_ptr<zenoh::Session> session_;
+  // The json5 configuration session_ was opened with. Kept so that a failed
+  // reconfiguration can roll back to it and so that the admin channel can
+  // report what is actually running.
+  std::string session_config_;
+  // Wall-clock time in nanoseconds of the last successful reconfiguration,
+  // or 0 if the session has never been reconfigured.
+  int64_t last_reconfigure_time_{0};
   // An optional SHM context that is initialized if SHM is enabled in the
   // zenoh session config.
   std::shared_ptr<rmw_zenoh_cpp::ShmContext> shm_;
@@ -580,6 +930,9 @@ private:
   // liveliness_declare_subscriber() throws an exception if it fails,
   // so this should all be safe to do.
   std::optional<zenoh::Subscriber<void>> graph_subscriber_;
+  // The control channel a zenoh router plugin uses to push a new session
+  // configuration into this process.
+  std::unique_ptr<rmw_zenoh_cpp::AdminChannel> admin_channel_;
   // Equivalent to rmw_dds_common::Context's guard condition.
   // Guard condition that should be triggered when the graph changes.
   std::unique_ptr<rmw_guard_condition_t> graph_guard_condition_;
@@ -615,6 +968,12 @@ rmw_context_impl_s::~rmw_context_impl_s()
 std::string rmw_context_impl_s::enclave() const
 {
   return data_->enclave();
+}
+
+///=============================================================================
+std::size_t rmw_context_impl_s::domain_id() const
+{
+  return data_->domain_id();
 }
 
 ///=============================================================================
@@ -675,6 +1034,30 @@ std::shared_ptr<rmw_zenoh_cpp::BufferPool> rmw_context_impl_s::serialization_buf
 rmw_zenoh_cpp::BufferBackendContext * rmw_context_impl_s::buffer_backend_context()
 {
   return data_->buffer_backend_context();
+}
+
+///=============================================================================
+rmw_zenoh_cpp::SessionReadLock rmw_context_impl_s::lock_session_shared() const
+{
+  return data_->lock_session_shared();
+}
+
+///=============================================================================
+std::string rmw_context_impl_s::session_config() const
+{
+  return data_->session_config();
+}
+
+///=============================================================================
+int64_t rmw_context_impl_s::last_reconfigure_time() const
+{
+  return data_->last_reconfigure_time();
+}
+
+///=============================================================================
+rmw_ret_t rmw_context_impl_s::reconfigure(const std::string & config_json5, std::string & error)
+{
+  return data_->reconfigure(config_json5, error);
 }
 
 ///=============================================================================

@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <memory>
@@ -21,7 +22,10 @@
 #include <thread>
 
 #include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <zenoh.hxx>
+
+#include "rmw/error_handling.h"
 
 #include "rmw_zenoh_cpp/rmw_zenoh.hpp"
 
@@ -97,4 +101,93 @@ int main(int argc, char ** argv)
 {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
+}
+
+TEST_F(TestRmwZenohSession, ReconfigureSessionKeepsHandlesValid)
+{
+  auto node = std::make_shared<rclcpp::Node>("test_zenoh_reconfigure");
+
+  auto node_handle = node->get_node_base_interface()->get_shared_rcl_node_handle();
+  auto rmw_context = rcl_context_get_rmw_context(node_handle->context);
+  ASSERT_NE(rmw_context, nullptr);
+
+  // A publisher and a subscription created before the reconfiguration must
+  // still work afterwards, through the very same handles.
+  std::atomic<int> received{0};
+  auto publisher = node->create_publisher<std_msgs::msg::String>("reconfigure_chatter", 10);
+  auto subscription = node->create_subscription<std_msgs::msg::String>(
+    "reconfigure_chatter", 10,
+    [&received](std_msgs::msg::String::ConstSharedPtr) {received.fetch_add(1);});
+
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(node);
+
+  // Establish a baseline: if messages do not flow in this environment at all
+  // there is nothing meaningful to assert about them after a reconfiguration.
+  const auto round_trip = [&executor, &publisher, &received]() {
+      const int before = received.load();
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      while (std::chrono::steady_clock::now() < deadline) {
+        std_msgs::msg::String msg;
+        msg.data = "hello";
+        publisher->publish(msg);
+        executor.spin_some();
+        if (received.load() > before) {
+          return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      }
+      return false;
+    };
+
+  const bool messages_flow = round_trip();
+  if (!messages_flow) {
+    GTEST_SKIP() << "Messages do not flow in this environment; "
+      "skipping the post-reconfiguration delivery check.";
+  }
+
+  const std::string config = rmw_zenoh_get_session_config(rmw_context);
+  ASSERT_FALSE(config.empty()) << "Failed to read the running session configuration";
+
+  auto old_session = rmw_zenoh_get_session(rmw_context);
+  ASSERT_NE(old_session, nullptr);
+  const std::string old_zid = old_session->get_zid().to_string();
+
+  // Rebuild the session from the configuration it is already running.
+  ASSERT_EQ(rmw_zenoh_reconfigure_session(rmw_context, config.c_str()), RMW_RET_OK)
+    << rmw_get_error_string().str;
+
+  auto new_session = rmw_zenoh_get_session(rmw_context);
+  ASSERT_NE(new_session, nullptr);
+  EXPECT_NE(new_session.get(), old_session.get());
+  // The zenoh session id, and therefore every entity GID, necessarily changes.
+  EXPECT_NE(new_session->get_zid().to_string(), old_zid);
+
+  // The node, publisher and subscription handles are all still the ones the
+  // application created, and messages flow again over the new session.
+  EXPECT_STREQ(node->get_name(), "test_zenoh_reconfigure");
+  EXPECT_TRUE(round_trip()) << "No message was delivered after the reconfiguration";
+}
+
+TEST_F(TestRmwZenohSession, ReconfigureWithInvalidConfigIsRejected)
+{
+  auto node = std::make_shared<rclcpp::Node>("test_zenoh_reconfigure_invalid");
+
+  auto node_handle = node->get_node_base_interface()->get_shared_rcl_node_handle();
+  auto rmw_context = rcl_context_get_rmw_context(node_handle->context);
+  ASSERT_NE(rmw_context, nullptr);
+
+  auto session_before = rmw_zenoh_get_session(rmw_context);
+  ASSERT_NE(session_before, nullptr);
+
+  // A payload that is not a zenoh configuration is rejected before anything is
+  // torn down, so the running session is left untouched.
+  EXPECT_EQ(
+    rmw_zenoh_reconfigure_session(rmw_context, "this is not json5"),
+    RMW_RET_INVALID_ARGUMENT);
+  rmw_reset_error();
+
+  auto session_after = rmw_zenoh_get_session(rmw_context);
+  ASSERT_NE(session_after, nullptr);
+  EXPECT_EQ(session_after.get(), session_before.get());
 }

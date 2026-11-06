@@ -83,6 +83,7 @@ rmw_publisher_event_init(
   }
 
   // Register the event with graph cache.
+  const auto session_lock = context_impl->lock_session_shared();
   std::weak_ptr<rmw_zenoh_cpp::PublisherData> data_wp = pub_data;
   context_impl->graph_cache()->set_qos_event_callback(
     pub_data->gid_hash(),
@@ -146,6 +147,7 @@ rmw_subscription_event_init(
   }
 
   // std::weak_ptr<rmw_zenoh_cpp::SubscriptionData> data_wp = sub_data;
+  const auto session_lock = sub_data->lock_session();
   sub_data->graph_cache()->set_qos_event_callback(
     sub_data->gid_hash(),
     zenoh_event_type,

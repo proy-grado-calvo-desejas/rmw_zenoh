@@ -17,6 +17,7 @@ if(BUILD_TESTING)
   find_package(ament_lint_common REQUIRED)
   find_package(rclcpp REQUIRED)
   find_package(rmw_zenoh_cpp REQUIRED)
+  find_package(std_msgs REQUIRED)
   find_package(zenoh_cpp_vendor REQUIRED)
 
   ament_lint_auto_find_test_dependencies()
@@ -27,6 +28,7 @@ if(BUILD_TESTING)
   target_link_libraries(test_rmw_zenoh_session
     rclcpp::rclcpp
     rmw_zenoh_cpp::rmw_zenoh_cpp
+    ${std_msgs_TARGETS}
     zenohcxx::zenohc
     ament_cmake_ros_core::ament_ros_defaults
   )

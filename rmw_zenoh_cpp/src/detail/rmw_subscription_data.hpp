@@ -38,6 +38,7 @@
 #include "graph_cache.hpp"
 #include "liveliness_utils.hpp"
 #include "message_type_support.hpp"
+#include "session_lock.hpp"
 #include "type_support_common.hpp"
 #include "zenoh_utils.hpp"
 
@@ -126,6 +127,22 @@ public:
   // Check if this SubscriptionData is shutdown.
   bool is_shutdown() const;
 
+  // Undeclare every Zenoh handle held by this subscription without destroying
+  // the SubscriptionData itself, so that the rmw_subscription_t handed to the
+  // application -- and any weak reference a wait set holds -- stays valid.
+  // Anything still queued is dropped: those payloads belong to buffers owned by
+  // the session that is about to go away.
+  void detach_from_session();
+
+  // Re-declare every Zenoh handle on `session`.
+  // The liveliness Entity is rebuilt so that it advertises the id of the new
+  // session, which also changes the zenoh-level gid of this subscription.
+  bool rebind(const std::shared_ptr<zenoh::Session> & session);
+
+  // Acquire a shared lock on the Zenoh session of the context that owns this
+  // subscription. Held by RMW entry points for the duration of a call.
+  SessionReadLock lock_session() const;
+
   // Destructor.
   ~SubscriptionData();
 
@@ -156,15 +173,16 @@ private:
     const rmw_node_t * rmw_node,
     std::shared_ptr<GraphCache> graph_cache,
     std::shared_ptr<liveliness::Entity> entity,
-    std::shared_ptr<zenoh::Session> session,
     const void * type_support_impl,
     std::unique_ptr<MessageTypeSupport> type_support,
     rmw_subscription_options_t sub_options,
     bool is_buffer_aware,
     std::vector<std::string> my_backend_types);
 
-  // Initialize the subscription.
-  bool init();
+  // Declare the base subscriber, the buffer-aware endpoints and the liveliness
+  // token on `session`, then (re-)register the publisher discovery callback.
+  // Used by both make() and rebind().
+  bool declare_on_session(const std::shared_ptr<zenoh::Session> & session);
 
   // Discovery callback for Buffer-aware subscriptions.
   void on_publisher_discovered(const liveliness::Entity & entity);
@@ -174,8 +192,9 @@ private:
     const std::string & key,
     std::optional<EndpointInfoStorage> publisher_info);
 
-  // Create a Zenoh subscription endpoint (does not require mutex_).
+  // Create a Zenoh subscription endpoint on `session` (does not require mutex_).
   std::shared_ptr<SubscriptionEndpoint> create_subscription_endpoint(
+    const std::shared_ptr<zenoh::Session> & session,
     const std::string & key,
     std::optional<EndpointInfoStorage> publisher_info,
     bool is_accelerated);

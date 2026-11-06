@@ -17,8 +17,10 @@
 #include <cstddef>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "logging_macros.hpp"
 #include "message_type_support.hpp"
@@ -78,7 +80,7 @@ std::shared_ptr<NodeData> NodeData::make(
       node,
       id,
       std::move(entity),
-      std::move(token)
+      std::optional<zenoh::LivelinessToken>(std::move(token))
     });
 }
 
@@ -87,7 +89,7 @@ NodeData::NodeData(
   const rmw_node_t * const node,
   std::size_t id,
   std::shared_ptr<liveliness::Entity> entity,
-  zenoh::LivelinessToken token)
+  std::optional<zenoh::LivelinessToken> token)
 : node_(node),
   id_(std::move(id)),
   entity_(std::move(entity)),
@@ -400,17 +402,172 @@ rmw_ret_t NodeData::shutdown()
     return ret;
   }
 
-  // Unregister this node from the ROS graph.
-  zenoh::ZResult result;
-  std::move(token_).value().undeclare(&result);
-  if (result != Z_OK) {
-    RMW_ZENOH_LOG_ERROR_NAMED(
-      "rmw_zenoh_cpp",
-      "Unable to undeclare the liveliness token");
-    return RMW_RET_ERROR;
+  // Unregister this node from the ROS graph. token_ is empty while the node is
+  // detached from a session, which is the case between the teardown and
+  // re-declare halves of a reconfiguration.
+  std::optional<zenoh::LivelinessToken> token;
+  {
+    std::lock_guard<std::mutex> lock_guard(mutex_);
+    token = std::move(token_);
+    token_.reset();
+  }
+
+  if (token.has_value()) {
+    zenoh::ZResult result;
+    std::move(token.value()).undeclare(&result);
+    if (result != Z_OK) {
+      RMW_ZENOH_LOG_ERROR_NAMED(
+        "rmw_zenoh_cpp",
+        "Unable to undeclare the liveliness token");
+      return RMW_RET_ERROR;
+    }
   }
 
   return ret;
+}
+
+///=============================================================================
+void NodeData::detach_from_session()
+{
+  std::optional<zenoh::LivelinessToken> token;
+  std::vector<PublisherDataPtr> pubs;
+  std::vector<SubscriptionDataPtr> subs;
+  std::vector<ServiceDataPtr> services;
+  std::vector<ClientDataPtr> clients;
+  {
+    std::lock_guard<std::mutex> lock_guard(mutex_);
+    if (is_shutdown_.load(std::memory_order_acquire)) {
+      return;
+    }
+    token = std::move(token_);
+    token_.reset();
+    // Snapshot the leaves so that the (possibly slow) undeclare calls below run
+    // without holding mutex_.
+    pubs.reserve(pubs_.size());
+    for (const auto & entry : pubs_) {
+      pubs.push_back(entry.second);
+    }
+    subs.reserve(subs_.size());
+    for (const auto & entry : subs_) {
+      subs.push_back(entry.second);
+    }
+    services.reserve(services_.size());
+    for (const auto & entry : services_) {
+      services.push_back(entry.second);
+    }
+    clients.reserve(clients_.size());
+    for (const auto & entry : clients_) {
+      clients.push_back(entry.second);
+    }
+  }
+
+  for (const auto & pub_data : pubs) {
+    pub_data->detach_from_session();
+  }
+  for (const auto & sub_data : subs) {
+    sub_data->detach_from_session();
+  }
+  for (const auto & service_data : services) {
+    service_data->detach_from_session();
+  }
+  for (const auto & client_data : clients) {
+    client_data->detach_from_session();
+  }
+
+  // The node token goes last so that the node disappears from remote graphs
+  // only after everything it owns has already gone.
+  if (token.has_value()) {
+    zenoh::ZResult result;
+    std::move(token.value()).undeclare(&result);
+    if (result != Z_OK) {
+      RMW_ZENOH_LOG_ERROR_NAMED(
+        "rmw_zenoh_cpp",
+        "Unable to undeclare the liveliness token for node /%s while detaching",
+        entity_->node_name().c_str());
+    }
+  }
+}
+
+///=============================================================================
+bool NodeData::rebind(const std::shared_ptr<zenoh::Session> & session)
+{
+  std::vector<PublisherDataPtr> pubs;
+  std::vector<SubscriptionDataPtr> subs;
+  std::vector<ServiceDataPtr> services;
+  std::vector<ClientDataPtr> clients;
+  {
+    std::lock_guard<std::mutex> lock_guard(mutex_);
+    if (is_shutdown_.load(std::memory_order_acquire)) {
+      // A node destroyed during the reconfiguration window stays destroyed.
+      return true;
+    }
+
+    // The liveliness keyexpr embeds the zenoh session id, so the entity has to
+    // be rebuilt for the new session.
+    auto entity = liveliness::Entity::make(
+      session->get_zid(),
+      std::to_string(id_),
+      std::to_string(id_),
+      liveliness::EntityType::Node,
+      entity_->node_info());
+    if (entity == nullptr) {
+      RMW_ZENOH_LOG_ERROR_NAMED(
+        "rmw_zenoh_cpp",
+        "Unable to rebuild the entity for node /%s on the new zenoh session.",
+        entity_->node_name().c_str());
+      return false;
+    }
+    entity_ = std::move(entity);
+
+    zenoh::ZResult result;
+    auto token = session->liveliness_declare_token(
+      zenoh::KeyExpr(entity_->liveliness_keyexpr()),
+      zenoh::Session::LivelinessDeclarationOptions::create_default(),
+      &result);
+    if (result != Z_OK) {
+      RMW_ZENOH_LOG_ERROR_NAMED(
+        "rmw_zenoh_cpp",
+        "Unable to re-create the liveliness token for node /%s.",
+        entity_->node_name().c_str());
+      return false;
+    }
+    token_ = std::move(token);
+
+    pubs.reserve(pubs_.size());
+    for (const auto & entry : pubs_) {
+      pubs.push_back(entry.second);
+    }
+    subs.reserve(subs_.size());
+    for (const auto & entry : subs_) {
+      subs.push_back(entry.second);
+    }
+    services.reserve(services_.size());
+    for (const auto & entry : services_) {
+      services.push_back(entry.second);
+    }
+    clients.reserve(clients_.size());
+    for (const auto & entry : clients_) {
+      clients.push_back(entry.second);
+    }
+  }
+
+  // Keep going after a failure so that as much of the node as possible is
+  // brought back up; the caller reports the overall outcome.
+  bool ok = true;
+  for (const auto & pub_data : pubs) {
+    ok = pub_data->rebind(session) && ok;
+  }
+  for (const auto & sub_data : subs) {
+    ok = sub_data->rebind(session) && ok;
+  }
+  for (const auto & service_data : services) {
+    ok = service_data->rebind(session) && ok;
+  }
+  for (const auto & client_data : clients) {
+    ok = client_data->rebind(session) && ok;
+  }
+
+  return ok;
 }
 
 ///=============================================================================

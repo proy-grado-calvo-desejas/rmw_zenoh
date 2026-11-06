@@ -141,7 +141,6 @@ std::shared_ptr<ServiceData> ServiceData::make(
       node,
       rmw_service,
       std::move(entity),
-      session,
       std::move(keyexpr),
       request_members,
       response_members,
@@ -149,14 +148,26 @@ std::shared_ptr<ServiceData> ServiceData::make(
       std::move(response_type_support)
     });
 
+  if (!service_data->declare_on_session(session)) {
+    // Error already handled.
+    return nullptr;
+  }
+
+  return service_data;
+}
+
+///=============================================================================
+bool ServiceData::declare_on_session(const std::shared_ptr<zenoh::Session> & session)
+{
+  zenoh::ZResult result;
 
   zenoh::Session::QueryableOptions qable_options =
     zenoh::Session::QueryableOptions::create_default();
   qable_options.complete = true;
 
-  std::weak_ptr<rmw_zenoh_cpp::ServiceData> data_wp = service_data;
-  service_data->qable_ = session->declare_queryable(
-    service_data->keyexpr_,
+  std::weak_ptr<rmw_zenoh_cpp::ServiceData> data_wp = weak_from_this();
+  auto qable = session->declare_queryable(
+    keyexpr_,
     [data_wp](const zenoh::Query & query) {
       auto sub_data = data_wp.lock();
       if (sub_data == nullptr) {
@@ -174,22 +185,27 @@ std::shared_ptr<ServiceData> ServiceData::make(
     &result);
   if (result != Z_OK) {
     RMW_SET_ERROR_MSG("unable to create zenoh queryable");
-    return nullptr;
+    return false;
   }
 
-  std::string liveliness_keyexpr = service_data->entity_->liveliness_keyexpr();
-  service_data->token_ = session->liveliness_declare_token(
-    zenoh::KeyExpr(liveliness_keyexpr),
+  auto token = session->liveliness_declare_token(
+    zenoh::KeyExpr(entity_->liveliness_keyexpr()),
     zenoh::Session::LivelinessDeclarationOptions::create_default(),
     &result);
   if (result != Z_OK) {
     RMW_ZENOH_LOG_ERROR_NAMED(
       "rmw_zenoh_cpp",
       "Unable to create liveliness token for the service.");
-    return nullptr;
+    std::move(qable).undeclare(&result);
+    return false;
   }
 
-  return service_data;
+  std::lock_guard<std::mutex> lock(mutex_);
+  sess_ = session;
+  qable_ = std::move(qable);
+  token_ = std::move(token);
+  initialized_ = true;
+  return true;
 }
 
 ///=============================================================================
@@ -197,7 +213,6 @@ ServiceData::ServiceData(
   const rmw_node_t * rmw_node,
   const rmw_service_t * rmw_service,
   std::shared_ptr<liveliness::Entity> entity,
-  std::shared_ptr<zenoh::Session> session,
   zenoh::KeyExpr keyexpr,
   const void * request_type_support_impl,
   const void * response_type_support_impl,
@@ -206,7 +221,6 @@ ServiceData::ServiceData(
 : rmw_node_(rmw_node),
   rmw_service_(rmw_service),
   entity_(std::move(entity)),
-  sess_(std::move(session)),
   keyexpr_(std::move(keyexpr)),
   request_type_support_impl_(request_type_support_impl),
   response_type_support_impl_(response_type_support_impl),
@@ -524,27 +538,126 @@ rmw_ret_t ServiceData::shutdown()
     return ret;
   }
 
-  // Unregister this node from the ROS graph.
-  if (initialized_) {
-    zenoh::ZResult result;
-    std::move(token_).value().undeclare(&result);
-    if (result != Z_OK) {
-      RMW_ZENOH_LOG_ERROR_NAMED(
-        "rmw_zenoh_cpp",
-        "Unable to undeclare the liveliness token");
-      return RMW_RET_ERROR;
+  // Unregister this node from the ROS graph. initialized_ is false while the
+  // service is detached from a session, which is the case between the teardown
+  // and re-declare halves of a reconfiguration.
+  // The handles are moved out under mutex_ and undeclared without it:
+  // undeclaring the queryable blocks until in-flight query callbacks return,
+  // and those callbacks take mutex_ in add_new_query().
+  std::optional<zenoh::Queryable<void>> qable;
+  std::optional<zenoh::LivelinessToken> token;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!initialized_) {
+      return RMW_RET_OK;
     }
-
-    std::move(qable_).value().undeclare(&result);
-    if (result != Z_OK) {
-      RMW_ZENOH_LOG_ERROR_NAMED(
-        "rmw_zenoh_cpp",
-        "Unable to undeclare the queryable");
-      return RMW_RET_ERROR;
-    }
+    initialized_ = false;
+    token = std::move(token_);
+    token_.reset();
+    qable = std::move(qable_);
+    qable_.reset();
   }
 
-  return RMW_RET_OK;
+  zenoh::ZResult result;
+  std::move(token.value()).undeclare(&result);
+  if (result != Z_OK) {
+    RMW_ZENOH_LOG_ERROR_NAMED(
+      "rmw_zenoh_cpp",
+      "Unable to undeclare the liveliness token");
+    ret = RMW_RET_ERROR;
+  }
+
+  std::move(qable.value()).undeclare(&result);
+  if (result != Z_OK) {
+    RMW_ZENOH_LOG_ERROR_NAMED(
+      "rmw_zenoh_cpp",
+      "Unable to undeclare the queryable");
+    ret = RMW_RET_ERROR;
+  }
+
+  return ret;
+}
+
+///=============================================================================
+void ServiceData::detach_from_session()
+{
+  std::optional<zenoh::Queryable<void>> qable;
+  std::optional<zenoh::LivelinessToken> token;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (is_shutdown_.load(std::memory_order_acquire) || !initialized_) {
+      return;
+    }
+    initialized_ = false;
+    qable = std::move(qable_);
+    qable_.reset();
+    token = std::move(token_);
+    token_.reset();
+    // The queued zenoh::Query objects are bound to the session that is about to
+    // be destroyed, so they cannot be answered any more. Clients waiting on
+    // them will time out. Reconfiguration is documented as a brief network blip.
+    query_queue_.clear();
+    sequence_to_query_map_.clear();
+    sess_.reset();
+  }
+
+  zenoh::ZResult result;
+  if (token.has_value()) {
+    std::move(token.value()).undeclare(&result);
+    if (result != Z_OK) {
+      RMW_ZENOH_LOG_ERROR_NAMED(
+        "rmw_zenoh_cpp",
+        "Unable to undeclare the liveliness token for service '%s' while detaching",
+        entity_->topic_info().value().name_.c_str());
+    }
+  }
+  if (qable.has_value()) {
+    std::move(qable.value()).undeclare(&result);
+    if (result != Z_OK) {
+      RMW_ZENOH_LOG_ERROR_NAMED(
+        "rmw_zenoh_cpp",
+        "Unable to undeclare the queryable for service '%s' while detaching",
+        entity_->topic_info().value().name_.c_str());
+    }
+  }
+}
+
+///=============================================================================
+bool ServiceData::rebind(const std::shared_ptr<zenoh::Session> & session)
+{
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (is_shutdown_.load(std::memory_order_acquire)) {
+      // A service destroyed during the reconfiguration window stays destroyed.
+      return true;
+    }
+    // The liveliness keyexpr -- and therefore the gid derived from it -- embeds
+    // the zenoh session id, so the entity has to be rebuilt for the new session.
+    // The service keyexpr itself does not depend on the session and is reused.
+    auto entity = liveliness::Entity::make(
+      session->get_zid(),
+      entity_->nid(),
+      entity_->id(),
+      liveliness::EntityType::Service,
+      entity_->node_info(),
+      entity_->topic_info());
+    if (entity == nullptr) {
+      RMW_ZENOH_LOG_ERROR_NAMED(
+        "rmw_zenoh_cpp",
+        "Unable to rebuild the entity for service %s on the new zenoh session.",
+        entity_->topic_info().value().name_.c_str());
+      return false;
+    }
+    entity_ = std::move(entity);
+  }
+
+  return declare_on_session(session);
+}
+
+///=============================================================================
+SessionReadLock ServiceData::lock_session() const
+{
+  return static_cast<rmw_context_impl_t *>(rmw_node_->context->impl)->lock_session_shared();
 }
 
 ///=============================================================================
