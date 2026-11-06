@@ -340,7 +340,7 @@ The payload is the raw json5 configuration, in the same format as [`DEFAULT_RMW_
 
 Two sibling keys complete the channel:
 
-* `@ros2_admin/<domain_id>/session/<session_id>/current_config` — a queryable that replies with `{"session_id": ..., "last_reconfigure_time_ns": ..., "config": ...}`, so the plugin can read back what is actually loaded instead of trusting its own send history.
+* `@ros2_admin/<domain_id>/session/<session_id>/current_config` — a queryable that replies with `{"session_id": ..., "last_reconfigure_time_ns": ..., "config": ...}`, so the plugin can read back what is actually loaded instead of trusting its own send history. The reply is sent on that concrete key, so a wildcard query (`@ros2_admin/*/session/*/current_config`) tells the caller each replier's domain and session id.
 * `@ros2_admin/<domain_id>/session/<session_id>/ack` — the outcome of each reconfiguration attempt, as `{"session_id": ..., "success": ..., "error": ...}`. The session id in both the ack key and its payload is the one in force *after* the attempt.
 
 ### Flow
