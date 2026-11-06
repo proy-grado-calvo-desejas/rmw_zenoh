@@ -178,7 +178,7 @@ bool AdminChannel::declare_on_session(
 
   auto queryable = session->declare_queryable(
     zenoh::KeyExpr(current_config_key),
-    [this](const zenoh::Query & query) {
+    [this, current_config_key](const zenoh::Query & query) {
       std::string payload;
       {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -191,9 +191,12 @@ bool AdminChannel::declare_on_session(
       auto options = zenoh::Query::ReplyOptions::create_default();
       options.encoding = zenoh::Encoding("application/json");
       zenoh::ZResult reply_result;
+      // Reply on our own concrete key, not the query's: a query for
+      // @ros2_admin/*/session/*/current_config would otherwise get the wildcard
+      // back, and the domain and session id are only recoverable from the key.
       query.reply(
-        query.get_keyexpr(), zenoh::Bytes(std::move(payload)), std::move(options),
-        &reply_result);
+        zenoh::KeyExpr(current_config_key), zenoh::Bytes(std::move(payload)),
+        std::move(options), &reply_result);
       if (reply_result != Z_OK) {
         RMW_ZENOH_LOG_ERROR_NAMED(
           "rmw_zenoh_cpp",
